@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.sql import text
 from sqlalchemy.sql.elements import ColumnElement
 
+from agno.db.oracle.schemas import OracleClobJSON, OracleNativeJSON
 from agno.utils.log import log_error, log_warning
 
 # A dialect instance purely for identifier quoting decisions (reserved-word
@@ -164,6 +165,51 @@ def apply_sorting(stmt: Any, table: Table, sort_by: Optional[str] = None, sort_o
     if sort_order == "asc":
         return stmt.order_by(sort_column.asc())
     return stmt.order_by(sort_column.desc())
+
+
+def restore_json_column_types(connection: Connection, table: Table, schema_definition: Dict[str, Any]) -> Table:
+    """Restore Agno JSON converters using the existing physical column types."""
+    json_columns = []
+
+    for column in table.columns:
+        config = schema_definition.get(column.name)
+        if not isinstance(config, dict):
+            continue
+
+        type_factory = config.get("type")
+        if type_factory is None:
+            continue
+
+        if isinstance(type_factory(), (OracleClobJSON, OracleNativeJSON)):
+            json_columns.append(column)
+
+    if not json_columns:
+        return table
+
+    params = {"table_name": connection.dialect.denormalize_name(table.name)}
+    if table.schema is None:
+        query = text("SELECT column_name, data_type FROM user_tab_columns WHERE table_name = :table_name")
+    else:
+        params["owner"] = connection.dialect.denormalize_name(table.schema)
+        query = text(
+            "SELECT column_name, data_type FROM all_tab_columns WHERE owner = :owner AND table_name = :table_name"
+        )
+
+    rows = connection.execute(query, params).all()
+    storage_types = {connection.dialect.normalize_name(column_name): data_type for column_name, data_type in rows}
+
+    for column in json_columns:
+        storage_type = storage_types.get(column.name)
+        if storage_type == "CLOB":
+            column.type = OracleClobJSON()
+        elif storage_type == "JSON":
+            column.type = OracleNativeJSON()
+        else:
+            raise ValueError(
+                f"Unsupported physical type {storage_type!r} for JSON column {table.fullname}.{column.name}"
+            )
+
+    return table
 
 
 # -- Table existence and validity --

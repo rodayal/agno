@@ -70,6 +70,7 @@ from agno.db.oracle.utils import (
     partial_unique_index_elements,
     to_db_user_id,
     truncate_identifier,
+    restore_json_column_types,
 )
 from agno.db.schemas.evals import EvalFilterType, EvalRunRecord, EvalType
 from agno.db.schemas.knowledge import KnowledgeRow
@@ -459,25 +460,54 @@ class AsyncOracleDb(AsyncBaseDb):
             else:
                 log_error(f"Could not create table {table_name}: {str(e)}")
                 raise
-            return await self._reflect_table(table_name)
+            return await self._reflect_table(table_name, table_type)
 
-    async def _reflect_table(self, table_name: str) -> Table:
-        async with self.db_engine.connect() as conn:
+    async def _reflect_table(self, table_name: str, table_type: str) -> Table:
+        await self._ensure_ready()
+        assert self.capabilities is not None
 
-            def _reflect(sync_conn):
-                return Table(table_name, self.metadata, schema=self.db_schema, autoload_with=sync_conn)
+        schema_definition = get_table_schema_definition(
+            table_type,
+            self.capabilities,
+            traces_table_name=self.trace_table_name,
+            db_schema=self.db_schema,
+            schedules_table_name=self.schedules_table_name,
+            session_table_name=self.session_table_name,
+            components_table_name=self.components_table_name,
+            component_configs_table_name=self.component_configs_table_name,
+        )
 
-            return await conn.run_sync(_reflect)
+        async with self.db_engine.connect() as connection:
+
+            def reflect(sync_connection):
+                table = Table(
+                    table_name,
+                    self.metadata,
+                    schema=self.db_schema,
+                    autoload_with=sync_connection,
+                )
+                return restore_json_column_types(sync_connection, table, schema_definition)
+
+            return await connection.run_sync(reflect)
 
     def _resolve_fk_reference(self, fk_ref: str) -> str:
+        """Resolve the table name and apply the schema qualifier only once."""
         parts = fk_ref.rsplit(".", 1)
-        if len(parts) == 2:
-            table, column = parts
-            resolved_table = self._resolve_table_name(table)
-            if self.db_schema:
-                return f"{self.db_schema}.{resolved_table}.{column}"
-            return f"{resolved_table}.{column}"
-        return fk_ref
+        if len(parts) != 2:
+            return fk_ref
+
+        table_reference, column = parts
+
+        if "." in table_reference:
+            schema, table_name = table_reference.rsplit(".", 1)
+        else:
+            schema = self.db_schema
+            table_name = table_reference
+
+        resolved_table = self._resolve_table_name(table_name)
+        if schema:
+            return f"{schema}.{resolved_table}.{column}"
+        return f"{resolved_table}.{column}"
 
     async def _resolve_table(
         self, table_name: str, table_type: str, create_table_if_not_found: Optional[bool] = False
@@ -514,7 +544,7 @@ class AsyncOracleDb(AsyncBaseDb):
             )
 
         try:
-            table = await self._reflect_table(table_name)
+            table = await self._reflect_table(table_name, table_type)
             self._store_resolved_table(table_type, table_name, table)
             return table
         except Exception as e:

@@ -77,6 +77,7 @@ from agno.db.oracle.utils import (
     partial_unique_index_elements,
     to_db_user_id,
     truncate_identifier,
+    restore_json_column_types,
 )
 from agno.db.schemas.evals import EvalFilterType, EvalRunRecord, EvalType
 from agno.db.schemas.knowledge import KnowledgeRow
@@ -362,21 +363,23 @@ class OracleDb(BaseDb):
         return table_map.get(logical_name, logical_name)
 
     def _resolve_fk_reference(self, fk_ref: str) -> str:
-        """Resolve "logical_table.column" to a schema-qualified reference.
-
-        Unlike Postgres, the schema qualifier is omitted entirely when
-        db_schema is None (the connecting user's own schema) -- Oracle tables
-        are created unqualified in that case, and qualifying the FK target
-        would reference a schema the parent table was never created in.
-        """
+        """Resolve the table name and apply the schema qualifier only once."""
         parts = fk_ref.rsplit(".", 1)
-        if len(parts) == 2:
-            table, column = parts
-            resolved_table = self._resolve_table_name(table)
-            if self.db_schema:
-                return f"{self.db_schema}.{resolved_table}.{column}"
-            return f"{resolved_table}.{column}"
-        return fk_ref
+        if len(parts) != 2:
+            return fk_ref
+
+        table_reference, column = parts
+
+        if "." in table_reference:
+            schema, table_name = table_reference.rsplit(".", 1)
+        else:
+            schema = self.db_schema
+            table_name = table_reference
+
+        resolved_table = self._resolve_table_name(table_name)
+        if schema:
+            return f"{schema}.{resolved_table}.{column}"
+        return f"{resolved_table}.{column}"
 
     def _create_table(self, table_name: str, table_type: str) -> Table:
         """Create a table for ``table_type``, translating the five special
@@ -555,10 +558,28 @@ class OracleDb(BaseDb):
             else:
                 log_error(f"Could not create table {table_name}: {str(e)}")
                 raise
-            return self._reflect_table(table_name)
+            return self._reflect_table(table_name, table_type)
 
-    def _reflect_table(self, table_name: str) -> Table:
-        return Table(table_name, self.metadata, schema=self.db_schema, autoload_with=self.db_engine)
+    def _reflect_table(self, table_name: str, table_type: str) -> Table:
+        schema_definition = get_table_schema_definition(
+            table_type,
+            self.capabilities,
+            traces_table_name=self.trace_table_name,
+            db_schema=self.db_schema,
+            schedules_table_name=self.schedules_table_name,
+            session_table_name=self.session_table_name,
+            components_table_name=self.components_table_name,
+            component_configs_table_name=self.component_configs_table_name,
+        )
+
+        with self.db_engine.connect() as connection:
+            table = Table(
+                table_name,
+                self.metadata,
+                schema=self.db_schema,
+                autoload_with=connection,
+            )
+            return restore_json_column_types(connection, table, schema_definition)
 
     def _resolve_table(
         self, table_name: str, table_type: str, create_table_if_not_found: Optional[bool] = False
@@ -591,7 +612,7 @@ class OracleDb(BaseDb):
             )
 
         try:
-            table = self._reflect_table(table_name)
+            table = self._reflect_table(table_name, table_type)
             self._store_resolved_table(table_type, table_name, table)
             return table
         except Exception as e:
