@@ -8,6 +8,7 @@ Mirrors the live-server-mirror convention used across tests/unit/db/*_postgres.p
 skips cleanly when no Oracle server is reachable.
 """
 
+import os
 import uuid
 
 import pytest
@@ -15,10 +16,12 @@ from sqlalchemy import create_engine, text
 
 from agno.db.oracle import OracleDb
 
-DB_URL = "oracle+oracledb://ai:ai@localhost:1523/?service_name=FREEPDB1"
+DB_URL = os.getenv("AGNO_TEST_ORACLE_URL", "")
 
 
 def _server_reachable() -> bool:
+    if not DB_URL:
+        return False
     engine = create_engine(DB_URL)
     try:
         with engine.connect() as conn:
@@ -33,7 +36,7 @@ def _server_reachable() -> bool:
 @pytest.fixture(scope="module")
 def _oracle_server():
     if not _server_reachable():
-        pytest.skip(f"Oracle server not reachable at {DB_URL}")
+        pytest.skip("AGNO_TEST_ORACLE_URL not set or Oracle is unavailable")
 
 
 @pytest.fixture

@@ -23,6 +23,7 @@ matching the sync harness's own convention (ADR 0009: no Oracle container in
 public CI).
 """
 
+import os
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict
@@ -43,11 +44,17 @@ from agno.tracing.schemas import Span, Trace
 
 PG_URL = "postgresql+psycopg://ai:ai@localhost:5532/ai"
 PG_ASYNC_URL = "postgresql+psycopg_async://ai:ai@localhost:5532/ai"
-ORACLE_SYNC_URL = "oracle+oracledb://ai:ai@localhost:1523/?service_name=FREEPDB1"
-ORACLE_ASYNC_URL = "oracle+oracledb_async://ai:ai@localhost:1523/?service_name=FREEPDB1"
+ORACLE_SYNC_URL = os.getenv("AGNO_TEST_ORACLE_URL", "")
+ORACLE_ASYNC_URL = ORACLE_SYNC_URL.replace(
+    "oracle+oracledb://",
+    "oracle+oracledb_async://",
+    1,
+)
 
 
 def _reachable(url: str) -> bool:
+    if not url:
+        return False
     engine = create_engine(url)
     try:
         with engine.connect() as conn:
@@ -64,7 +71,7 @@ def _servers_up():
     if not _reachable(PG_URL):
         pytest.skip(f"Postgres server not reachable at {PG_URL}")
     if not _reachable(ORACLE_SYNC_URL):
-        pytest.skip(f"Oracle server not reachable at {ORACLE_SYNC_URL}")
+        pytest.skip("AGNO_TEST_ORACLE_URL not set or Oracle is unavailable")
 
 
 @pytest_asyncio.fixture
@@ -197,12 +204,31 @@ async def _run_memory_metrics_knowledge_scenario(db) -> Dict[str, Any]:
     topics = await db.get_all_memory_topics()
     stats, stats_total = await db.get_user_memory_stats()
 
-    session = AgentSession(session_id="adiff-mm-session", agent_id="adiff-agent", user_id="bob", created_at=1700000000)
-    await db.upsert_session(session)
-    run = RunOutput(run_id="adiff-mm-run", agent_id="adiff-agent", status="COMPLETED")
-    await db.upsert_run(run, session_id="adiff-mm-session", user_id="bob", run_index=0)
+    for i, user_id in enumerate(("alice", "", None)):
+        session_id = f"adiff-mm-session-{i}"
+        session = AgentSession(
+            session_id=session_id,
+            agent_id="adiff-agent",
+            user_id=user_id,
+            created_at=1700000000 + i,
+        )
+        await db.upsert_session(session)
+
+        run = RunOutput(
+            run_id=f"adiff-mm-run-{i}",
+            agent_id="adiff-agent",
+            status="COMPLETED",
+        )
+        await db.upsert_run(
+            run,
+            session_id=session_id,
+            user_id=user_id,
+            run_index=0,
+        )
+
     calculated = await db.calculate_metrics()
     metrics_rows, _ = await db.get_metrics()
+    unowned_metrics = next(row for row in metrics_rows if row["user_id"] is None)
 
     row = KnowledgeRow(id="adiff-k1", name="doc1", description="test", metadata={}, user_id="alice")
     await db.upsert_knowledge_content(row)
@@ -216,6 +242,11 @@ async def _run_memory_metrics_knowledge_scenario(db) -> Dict[str, Any]:
         "topics_is_list": isinstance(topics, list),
         "stats_total_at_least_one": stats_total >= 1,
         "calculated_metrics_present": calculated is not None and len(calculated) > 0,
+        "unowned_metrics": {
+            "users_count": unowned_metrics["users_count"],
+            "agent_sessions_count": unowned_metrics["agent_sessions_count"],
+            "agent_runs_count": unowned_metrics["agent_runs_count"],
+        },
         "metrics_rows_present": len(metrics_rows) > 0,
         "fetched_k_name": fetched_k.name if fetched_k else None,
         "k_total_at_least_one": k_total >= 1,
@@ -227,6 +258,12 @@ async def _run_memory_metrics_knowledge_scenario(db) -> Dict[str, Any]:
 async def test_async_memory_metrics_knowledge_matches_postgres(pg_db, oracle_db):
     pg_result = await _run_memory_metrics_knowledge_scenario(pg_db)
     oracle_result = await _run_memory_metrics_knowledge_scenario(oracle_db)
+
+    assert pg_result["unowned_metrics"] == {
+        "users_count": 0,
+        "agent_sessions_count": 2,
+        "agent_runs_count": 2,
+    }
 
     assert oracle_result == pg_result, (
         f"AsyncOracleDb diverged from AsyncPostgresDb.\nPostgres: {pg_result}\nOracle:   {oracle_result}"

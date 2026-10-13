@@ -10,6 +10,7 @@ storage adapter's own live-server test files (ADR 0009: no Oracle container
 in public CI).
 """
 
+import os
 import uuid
 
 import pytest
@@ -20,10 +21,12 @@ from agno.vectordb.oracle.oracle import OracleVector, _to_db_user_id
 
 from .conftest import DeterministicEmbedder
 
-DB_URL = "oracle+oracledb://ai:ai@localhost:1523/?service_name=FREEPDB1"
+DB_URL = os.getenv("AGNO_TEST_ORACLE_URL", "")
 
 
 def _server_reachable() -> bool:
+    if not DB_URL:
+        return False
     engine = create_engine(DB_URL)
     try:
         with engine.connect() as conn:
@@ -38,7 +41,7 @@ def _server_reachable() -> bool:
 @pytest.fixture(scope="module")
 def _oracle_server():
     if not _server_reachable():
-        pytest.skip(f"Oracle server not reachable at {DB_URL}")
+        pytest.skip("AGNO_TEST_ORACLE_URL not set or Oracle is unavailable")
 
 
 @pytest.fixture

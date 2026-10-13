@@ -12,6 +12,7 @@ matching the sync storage-adapter harness's own convention (ADR 0009: no
 Oracle container in public CI).
 """
 
+import os
 import uuid
 from hashlib import md5
 from typing import Any, Dict, List
@@ -25,7 +26,7 @@ from agno.vectordb.oracle import OracleVector
 from agno.vectordb.pgvector import PgVector
 
 PG_URL = "postgresql+psycopg://ai:ai@localhost:5532/ai"
-ORACLE_URL = "oracle+oracledb://ai:ai@localhost:1523/?service_name=FREEPDB1"
+ORACLE_URL = os.getenv("AGNO_TEST_ORACLE_URL", "")
 
 
 class _CorpusEmbedder:
@@ -59,6 +60,8 @@ class _CorpusEmbedder:
 
 
 def _reachable(url: str) -> bool:
+    if not url:
+        return False
     engine = create_engine(url)
     try:
         with engine.connect() as conn:
@@ -75,7 +78,7 @@ def _servers_up():
     if not _reachable(PG_URL):
         pytest.skip(f"Postgres server not reachable at {PG_URL}")
     if not _reachable(ORACLE_URL):
-        pytest.skip(f"Oracle server not reachable at {ORACLE_URL}")
+        pytest.skip("AGNO_TEST_ORACLE_URL not set or Oracle is unavailable")
 
 
 @pytest.fixture

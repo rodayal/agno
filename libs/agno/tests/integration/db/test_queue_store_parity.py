@@ -16,6 +16,7 @@ the concurrency boundary deliberately is NOT.
 Skips per backend when its server is unreachable (PG at 5532, Redis at 6379).
 """
 
+import os
 import uuid
 
 import pytest
@@ -27,7 +28,23 @@ from agno.os.job_queue import _SyncStoreAdapter
 
 PG_URL = "postgresql+psycopg://ai:ai@localhost:5532/ai"
 REDIS_URL = "redis://localhost:6379"
-ORACLE_URL = "oracle+oracledb://ai:ai@localhost:1523/?service_name=FREEPDB1"
+ORACLE_URL = os.getenv("AGNO_TEST_ORACLE_URL", "")
+
+def _oracle_reachable() -> bool:
+    if not ORACLE_URL:
+        return False
+
+    from sqlalchemy import create_engine, text
+
+    engine = create_engine(ORACLE_URL)
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1 FROM dual"))
+        return True
+    except Exception:
+        return False
+    finally:
+        engine.dispose()
 
 
 def _port_open(port: int) -> bool:
@@ -42,7 +59,7 @@ def _port_open(port: int) -> bool:
 
 _PG_AVAILABLE = _port_open(5532)
 _REDIS_AVAILABLE = _port_open(6379)
-_ORACLE_AVAILABLE = _port_open(1523)
+_ORACLE_AVAILABLE = _oracle_reachable()
 
 try:
     import fakeredis
@@ -67,7 +84,7 @@ STORE_PARAMS = [
     pytest.param(
         "oracle",
         id="oracle",
-        marks=pytest.mark.skipif(not _ORACLE_AVAILABLE, reason="Oracle not available on localhost:1523"),
+        marks=pytest.mark.skipif(not _ORACLE_AVAILABLE, reason="AGNO_TEST_ORACLE_URL not set or Oracle is unavailable"),
     ),
 ]
 

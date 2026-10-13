@@ -23,6 +23,7 @@ The hammers gather N concurrent no-index saves and assert the landed indexes
 are exactly 0..N-1.
 """
 
+import os
 import asyncio
 import socket
 import threading
@@ -237,9 +238,25 @@ class TestSqliteBackfillRace:
 # for CI, so this skips cleanly there and only runs against a local container)
 # ---------------------------------------------------------------------------
 
-ORACLE_URL = "oracle+oracledb://ai:ai@localhost:1523/?service_name=FREEPDB1"
+ORACLE_URL = os.getenv("AGNO_TEST_ORACLE_URL", "")
 
-oracle_required = pytest.mark.skipif(not _port_open(1523), reason="Oracle not available on localhost:1523")
+def _oracle_reachable() -> bool:
+    if not ORACLE_URL:
+        return False
+
+    from sqlalchemy import create_engine, text
+
+    engine = create_engine(ORACLE_URL)
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1 FROM dual"))
+        return True
+    except Exception:
+        return False
+    finally:
+        engine.dispose()
+
+oracle_required = pytest.mark.skipif(not _oracle_reachable(), reason="AGNO_TEST_ORACLE_URL not set or Oracle is unavailable",)
 
 
 @oracle_required

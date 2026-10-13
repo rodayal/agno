@@ -1194,18 +1194,21 @@ class AsyncOracleDb(AsyncBaseDb):
             }
 
             async with self.async_session_factory() as sess, sess.begin():
-                existing_result = await sess.execute(
-                    select(table.c.session_id, table.c.user_id).where(table.c.session_id == values["session_id"])
+                # Enforce ownership during the write: an earlier SELECT
+                # can become stale before another request commits.
+                affected = await amerge_upsert(
+                    sess,
+                    table,
+                    key_columns=["session_id"],
+                    values=values,
+                    owner_column="user_id",
                 )
-                existing = existing_result.first()
-                if existing is not None and existing[1] is not None and existing[1] != values["user_id"]:
+                if affected == 0:
                     log_warning(
-                        f"upsert_session: session_id '{values['session_id']}' is owned by a different user; "
-                        "not overwriting."
+                        f"upsert_session: session_id '{values['session_id']}' "
+                        "is owned by a different user; not overwriting."
                     )
                     return None
-
-                await amerge_upsert(sess, table, key_columns=["session_id"], values=values)
                 row_result = await sess.execute(select(table).where(table.c.session_id == values["session_id"]))
                 row = row_result.fetchone()
                 if row is None:
@@ -1478,6 +1481,8 @@ class AsyncOracleDb(AsyncBaseDb):
         async with self.async_session_factory() as sess:
             result = await sess.execute(stmt)
             sessions = [dict(record._mapping) for record in result.fetchall()]
+            for session in sessions:
+                session["user_id"] = from_db_user_id(session.get("user_id"))
 
             if runs_table is not None and sessions:
                 session_ids = [s["session_id"] for s in sessions]

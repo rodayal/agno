@@ -391,6 +391,8 @@ def build_merge_statement(
     key_columns: Sequence[str],
     value_columns: Sequence[str],
     preserve_on_conflict: Sequence[str] = (),
+    *,
+    owner_column: Optional[str] = None,
 ):
     """Build a MERGE INTO statement upserting ``table`` on ``key_columns``.
 
@@ -429,8 +431,15 @@ def build_merge_statement(
     ("invalid identifier", since the stored name really is lowercase) --
     both confirmed against a live server. ``quote_column`` produces whatever
     the table's own DDL already committed to, for every column.
+
+    When owner_column is provided, the UPDATE branch only changes rows
+    whose existing owner is NULL or matches the incoming owner. The owner
+    condition is enforced by the write itself, not a separate precheck.
     """
     key_set = set(key_columns)
+    if owner_column is not None:
+        if owner_column not in value_columns or owner_column in key_set:
+            raise ValueError("owner_column must be a non-key column included in value_columns")
     preserve_set = set(preserve_on_conflict)
     update_columns = [c for c in value_columns if c not in key_set and c not in preserve_set]
 
@@ -448,6 +457,10 @@ def build_merge_statement(
     if update_columns:
         update_set = ", ".join(f"t.{q(c)} = s.{q(c)}" for c in update_columns)
         merge_sql += f" WHEN MATCHED THEN UPDATE SET {update_set}"
+
+        if owner_column is not None:
+            owner = q(owner_column)
+            merge_sql += f" WHERE (t.{owner} IS NULL OR t.{owner} = s.{owner})"
     merge_sql += f" WHEN NOT MATCHED THEN INSERT ({insert_columns}) VALUES ({insert_values})"
 
     typed_params = [bindparam(c, type_=table.c[c].type) for c in value_columns]
@@ -461,21 +474,36 @@ def merge_upsert(
     values: Dict[str, Any],
     max_attempts: int = DEFAULT_MERGE_RETRY_ATTEMPTS,
     preserve_on_conflict: Sequence[str] = (),
-) -> None:
-    """Execute a MERGE-based upsert of ``values`` into ``table``, keyed on
-    ``key_columns``, retrying on a concurrent ORA-00001 (see module docstring).
+    *,
+    owner_column: Optional[str] = None,
+) -> Optional[int]:
+    """Upsert one row, optionally restricting updates by owner.
 
-    ``connection`` is anything exposing ``.execute()`` with the same signature
-    -- an ORM ``Session`` or a Core ``Connection`` both work. Does not commit;
+    Guarded calls return the number of rows written: zero or one.
+    Unguarded calls retain their existing None return.
+    Retries concurrent unique-key conflicts without committing;
     the caller controls the transaction.
     """
-    stmt = build_merge_statement(table, key_columns, list(values.keys()), preserve_on_conflict=preserve_on_conflict)
+    stmt = build_merge_statement(
+        table,
+        key_columns,
+        list(values.keys()),
+        preserve_on_conflict=preserve_on_conflict,
+        owner_column=owner_column,
+    )
     attempt = 0
     while True:
         attempt += 1
         try:
-            connection.execute(stmt, values)
-            return
+            result = connection.execute(stmt, values)
+
+            if owner_column is None:
+                return None
+
+            rowcount = getattr(result, "rowcount", None)
+            if not isinstance(rowcount, int) or rowcount not in (0, 1):
+                raise RuntimeError("Owner-guarded MERGE did not report a reliable row count")
+            return rowcount
         except Exception as e:
             if is_unique_violation(e) and attempt < max_attempts:
                 continue
@@ -517,17 +545,30 @@ async def amerge_upsert(
     values: Dict[str, Any],
     max_attempts: int = DEFAULT_MERGE_RETRY_ATTEMPTS,
     preserve_on_conflict: Sequence[str] = (),
-) -> None:
-    """Async twin of ``merge_upsert``. ``build_merge_statement`` builds pure
-    SQL text with no I/O, so it is reused unchanged; only the execute+retry
-    loop needs an async form."""
-    stmt = build_merge_statement(table, key_columns, list(values.keys()), preserve_on_conflict=preserve_on_conflict)
+    *,
+    owner_column: Optional[str] = None,
+) -> Optional[int]:
+    """Asynchronous equivalent of the single-row merge_upsert helper."""
+    stmt = build_merge_statement(
+        table,
+        key_columns,
+        list(values.keys()),
+        preserve_on_conflict=preserve_on_conflict,
+        owner_column=owner_column,
+    )
     attempt = 0
     while True:
         attempt += 1
         try:
-            await connection.execute(stmt, values)
-            return
+            result = await connection.execute(stmt, values)
+
+            if owner_column is None:
+                return None
+
+            rowcount = getattr(result, "rowcount", None)
+            if not isinstance(rowcount, int) or rowcount not in (0, 1):
+                raise RuntimeError("Owner-guarded MERGE did not report a reliable row count")
+            return rowcount
         except Exception as e:
             if is_unique_violation(e) and attempt < max_attempts:
                 continue

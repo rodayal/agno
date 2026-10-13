@@ -14,7 +14,8 @@ Features:
 
 Setup: ./cookbook/scripts/run_oracle.sh (use the 23ai+ image; vector search
 requires Oracle Database 23ai or later, unlike storage, which works from 19c)
-Requires: uv pip install "agno[oracle]"
+Requires: uv pip install "agno[oracle,openai,cohere,pdf]"
+Running the full demo also requires OpenAI and Cohere API credentials.
 
 Keyword and hybrid search need optimize() called once, explicitly, after the
 knowledge base has content -- the knowledge layer never calls it for you. See

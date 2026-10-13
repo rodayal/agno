@@ -128,7 +128,8 @@ Each call creates a separate pool, so create and reuse one engine.
 `AsyncEngine` for `AsyncOracleDb(db_engine=engine)`, but only accepts an
 `oracle+oracledb_async://` URL — see the async section above.
 
-- [`shared_engine.py`](shared_engine.py) - Configure and share a pool without connecting
+- [`shared_engine.py`](shared_engine.py) - Configure and share a pool; `OracleDb`
+  connects once during construction to detect server capabilities
 
 ## Vector search, keyword search, hybrid search, and metadata filters
 

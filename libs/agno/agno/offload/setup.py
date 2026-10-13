@@ -92,7 +92,7 @@ def build_result_store(
         _warn_once(
             owner,
             f"Result offloading is not available on {type(store.db).__name__}; offloading is off for this "
-            f"{owner_kind}. It needs SqliteDb or PostgresDb (or a subclass), because stored payloads go "
+            f"{owner_kind}. It needs SqliteDb, PostgresDb, or OracleDb (or a subclass), because stored payloads go "
             "through the sync filesystem backend.",
         )
         return None

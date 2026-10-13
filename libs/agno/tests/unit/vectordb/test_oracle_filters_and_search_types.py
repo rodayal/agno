@@ -8,6 +8,7 @@ same reason: several of these behaviors (numeric JSON comparison, Oracle Text
 error codes) are genuine database behaviors a mocked session cannot reproduce.
 """
 
+import os
 import uuid
 
 import pytest
@@ -19,10 +20,12 @@ from agno.vectordb.oracle.oracle import OracleVector
 
 from .conftest import DeterministicEmbedder
 
-DB_URL = "oracle+oracledb://ai:ai@localhost:1523/?service_name=FREEPDB1"
+DB_URL = os.getenv("AGNO_TEST_ORACLE_URL", "")
 
 
 def _server_reachable() -> bool:
+    if not DB_URL:
+        return False
     engine = create_engine(DB_URL)
     try:
         with engine.connect() as conn:
@@ -37,7 +40,7 @@ def _server_reachable() -> bool:
 @pytest.fixture(scope="module")
 def _oracle_server():
     if not _server_reachable():
-        pytest.skip(f"Oracle server not reachable at {DB_URL}")
+        pytest.skip("AGNO_TEST_ORACLE_URL not set or Oracle is unavailable")
 
 
 @pytest.fixture
@@ -145,3 +148,31 @@ class TestTextSearchUnavailableIsActionable:
         db.optimize()
         results = db.keyword_search("alpha")
         assert any(r.name == "a" for r in results)
+
+
+class TestTextIndexFreshness:
+    def test_keyword_search_sees_document_inserted_after_optimize(self, db):
+        db.optimize()
+        db.insert(
+            content_hash="post-index-insert",
+            documents=[Document(name="saturn-doc", content="Space missions to Saturn")],
+        )
+
+        results = db.keyword_search("Saturn", limit=1)
+
+        assert [result.name for result in results] == ["saturn-doc"]
+
+    def test_keyword_search_sees_document_upserted_after_optimize(self, db):
+        db.insert(
+            content_hash="post-index-upsert",
+            documents=[Document(name="mars-doc", content="Space missions to Mars")],
+        )
+        db.optimize()
+        db.upsert(
+            content_hash="post-index-upsert",
+            documents=[Document(name="jupiter-doc", content="Space missions to Jupiter")],
+        )
+
+        results = db.keyword_search("Jupiter", limit=1)
+
+        assert [result.name for result in results] == ["jupiter-doc"]

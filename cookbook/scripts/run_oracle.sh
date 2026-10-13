@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 
 # One-command local Oracle Database for developing against agno's Oracle
 # storage and vector database adapters. Uses gvenzl/oracle-free (community,
@@ -11,47 +12,63 @@
 # cookbook/06_storage/oracle/README.md for the version matrix and how
 # db_schema and create_schema behave differently from Postgres on Oracle.
 
-if [ "$(docker ps -aq -f name=agno-oracle)" ]; then
-    echo "Removing existing agno-oracle container..."
-    docker rm -f agno-oracle
-fi
+AGNO_ORACLE_CONTAINER="${AGNO_ORACLE_CONTAINER:-agno-oracle}"
+AGNO_ORACLE_PORT="${AGNO_ORACLE_PORT:-1521}"
+
+wait_for_oracle() {
+  local attempt
+  for ((attempt = 1; attempt <= 120; attempt++)); do
+    if docker exec "$AGNO_ORACLE_CONTAINER" healthcheck.sh >/dev/null 2>&1; then
+      return 0
+    fi
+    echo "  ...waiting for Oracle (${attempt}/120)"
+    sleep 5
+  done
+
+  echo "Oracle did not become ready after 120 attempts." >&2
+  docker logs --tail 50 "$AGNO_ORACLE_CONTAINER" >&2 || true
+  return 1
+}
 
 echo "Starting Oracle Database Free container..."
-docker run -d --name agno-oracle \
-  -p 1521:1521 \
+docker run -d --name "$AGNO_ORACLE_CONTAINER" \
+  -p "127.0.0.1:${AGNO_ORACLE_PORT}:1521" \
   -e ORACLE_PASSWORD=ai \
   -e APP_USER=ai \
   -e APP_USER_PASSWORD=ai \
-  gvenzl/oracle-free:latest
+  ghcr.io/gvenzl/oracle-free:latest
 
 echo "Waiting for Oracle to become available (this can take a couple of minutes on first start)..."
-until docker logs agno-oracle 2>&1 | grep -q "DATABASE IS READY TO USE"; do
-  sleep 5
-  echo "  ...still starting"
-done
+wait_for_oracle
 echo "Oracle is ready."
 
 # Vector search needs an in-memory area sized for the HNSW graph. 256M is
 # enough for the cookbook examples; raise it for a larger corpus.
 echo "Configuring vector_memory_size for HNSW..."
-docker exec agno-oracle sqlplus -s sys/ai@localhost:1521/FREEPDB1 as sysdba <<'SQL'
-ALTER SYSTEM SET vector_memory_size = 256M SCOPE = SPFILE;
+docker exec -i "$AGNO_ORACLE_CONTAINER" sqlplus -s "sys/ai@localhost:1521/FREEPDB1 as sysdba" <<'SQL'
+WHENEVER OSERROR EXIT 1
+WHENEVER SQLERROR EXIT SQL.SQLCODE
+ALTER SESSION SET CONTAINER = CDB$ROOT;
+ALTER SYSTEM SET vector_memory_size = 256M SCOPE = SPFILE SID = '*';
+EXIT SUCCESS
 SQL
-RESTART_AT=$(date +%s)
-docker restart agno-oracle >/dev/null
+docker restart "$AGNO_ORACLE_CONTAINER" >/dev/null
 echo "Waiting for Oracle to come back up after the restart..."
-# The pre-restart "ready" message is still in the accumulated log, so wait for
-# one stamped after the restart rather than merely for the phrase to appear.
-until docker logs --since "@${RESTART_AT}" agno-oracle 2>&1 | grep -q "DATABASE IS READY TO USE"; do
-  sleep 5
-  echo "  ...still restarting"
-done
-
+# Wait for the restarted database to pass its health check.
+wait_for_oracle
+echo "Configuring the FREEPDB1 vector-memory allowance..."
+docker exec -i "$AGNO_ORACLE_CONTAINER" sqlplus -s "sys/ai@localhost:1521/FREEPDB1 as sysdba" <<'SQL'
+WHENEVER OSERROR EXIT 1
+WHENEVER SQLERROR EXIT SQL.SQLCODE
+ALTER SYSTEM SET vector_memory_size = 256M SCOPE = BOTH;
+SHOW PARAMETER vector_memory_size
+EXIT SUCCESS
+SQL
 echo "Database setup complete!"
 
 export ORACLE_HOST="localhost"
-export ORACLE_PORT="1521"
+export ORACLE_PORT="$AGNO_ORACLE_PORT"
+export ORACLE_DB_URL="oracle+oracledb://ai:ai@localhost:${AGNO_ORACLE_PORT}/?service_name=FREEPDB1"
 export ORACLE_SERVICE_NAME="FREEPDB1"
 export ORACLE_USER="ai"
 export ORACLE_PASSWORD="ai"
-export ORACLE_DB_URL="oracle+oracledb://ai:ai@localhost:1521/?service_name=FREEPDB1"

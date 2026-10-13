@@ -41,7 +41,7 @@ class OracleCapabilities:
 
     major: int
     full_version: str
-    native_json: bool  # JSON datatype: 21c and later. Below that: CLOB CHECK (IS JSON).
+    native_json: bool  # JSON datatype: 21c and later. Below that: JSON serialized in a CLOB without a database JSON constraint.
     native_boolean: bool  # BOOLEAN datatype: 23ai and later. Below that: NUMBER(1).
     vector: bool  # VECTOR datatype and AI Vector Search: 23ai and later.
 

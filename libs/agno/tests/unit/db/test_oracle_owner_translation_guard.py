@@ -16,6 +16,7 @@ The module skips cleanly when no Oracle server is reachable, per the
 project's convention for live-server mirrors.
 """
 
+import os
 import uuid
 
 import pytest
@@ -26,10 +27,12 @@ from agno.db.schemas.knowledge import KnowledgeRow
 from agno.db.schemas.memory import UserMemory
 from agno.session import AgentSession
 
-DB_URL = "oracle+oracledb://ai:ai@localhost:1523/?service_name=FREEPDB1"
+DB_URL = os.getenv("AGNO_TEST_ORACLE_URL", "")
 
 
 def _server_reachable() -> bool:
+    if not DB_URL:
+        return False
     engine = create_engine(DB_URL)
     try:
         with engine.connect() as conn:
@@ -44,7 +47,7 @@ def _server_reachable() -> bool:
 @pytest.fixture(scope="module")
 def _oracle_server():
     if not _server_reachable():
-        pytest.skip(f"Oracle server not reachable at {DB_URL}")
+        pytest.skip("AGNO_TEST_ORACLE_URL not set or Oracle is unavailable")
 
 
 @pytest.fixture

@@ -13,10 +13,10 @@ floor is enforced eagerly, in ``create()``, before any DDL is attempted --
 never in ``__init__``, which (like PgVector's) does no I/O at all, so the
 store can be instantiated without a live connection.
 
-Every async method offloads to a thread (``asyncio.to_thread``), deliberately
-mirroring PgVector's own approach rather than the genuinely-async storage
-adapter (ticket 13's ``AsyncOracleDb``) -- see ``async_search``'s own
-docstring for why, and for the recorded follow-up.
+Async database operations use worker threads via asyncio.to_thread.
+Ingestion awaits asynchronous embedding before dispatching synchronous
+database work. This adapter still uses a synchronous SQLAlchemy engine;
+a native asynchronous database implementation remains a follow-up.
 """
 
 import array
@@ -580,35 +580,61 @@ class OracleVector(VectorDb):
         batch_size: int = 100,
         user_id: Optional[str] = None,
     ) -> None:
-        self._require_owner_column(user_id)
-        try:
-            with self.Session() as sess:
-                for i in range(0, len(documents), batch_size):
-                    batch_docs = documents[i : i + batch_size]
-                    try:
-                        await self._async_embed_documents(batch_docs)
-                        batch_docs = retrievable_documents(batch_docs)
-                        batch_records = []
-                        for doc in batch_docs:
-                            try:
-                                batch_records.append(
-                                    self._get_document_record(doc, filters, content_hash, user_id, prepared=True)
-                                )
-                            except Exception as e:
-                                log_error(f"Error processing document '{doc.name}': {str(e)}")
+        if batch_size <= 0:
+            raise ValueError("batch_size must be greater than zero")
 
-                        batch_records = [r for r in batch_records if r.get("embedding")]
-                        if batch_records:
-                            sess.execute(self.table.insert(), batch_records)
-                            sess.commit()
-                            log_info(f"Inserted batch of {len(batch_records)} documents.")
-                    except Exception as e:
-                        log_error(f"Error with batch starting at index {i}: {str(e)}")
-                        sess.rollback()
-                        raise
+        try:
+            for i in range(0, len(documents), batch_size):
+                batch_docs = documents[i : i + batch_size]
+                await self._async_embed_documents(batch_docs)
+                batch_docs = retrievable_documents(batch_docs)
+
+                if batch_docs:
+                    await asyncio.to_thread(
+                        self._insert_prepared_batch,
+                        content_hash,
+                        batch_docs,
+                        filters,
+                        user_id,
+                    )
         except Exception as e:
             log_error(f"Error inserting documents: {str(e)}")
             raise
+
+    def _insert_prepared_batch(
+        self,
+        content_hash: str,
+        documents: List[Document],
+        filters: Optional[Dict[str, Any]] = None,
+        user_id: Optional[str] = None,
+    ) -> None:
+        """Write an already-embedded batch entirely in the worker thread."""
+        try:
+            self._require_owner_column(user_id)
+            batch_records = []
+
+            for doc in documents:
+                try:
+                    batch_records.append(
+                        self._get_document_record(
+                            doc, filters, content_hash, user_id, prepared=True
+                        )
+                    )
+                except EmbeddingError:
+                    raise
+                except Exception as e:
+                    log_error(f"Error processing document '{doc.name}': {str(e)}")
+
+            batch_records = [r for r in batch_records if r.get("embedding")]
+            if not batch_records:
+                return
+
+            with self.Session() as sess, sess.begin():
+                sess.execute(self.table.insert(), batch_records)
+
+            log_info(f"Inserted batch of {len(batch_records)} documents.")
+        finally:
+            self.Session.remove()
 
     # -- Upsert --
 
@@ -694,21 +720,30 @@ class OracleVector(VectorDb):
         batch_size: int = 100,
         user_id: Optional[str] = None,
     ) -> None:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be greater than zero")
+
         for document in documents:
             if not document.embedding:
                 document.embedding = None
+
         await aembed_before_replace(documents, self.embedder)
         documents = retrievable_documents(documents)
-        self._require_owner_column(user_id)
+
         try:
-            if self.content_hash_exists(content_hash, user_id=user_id):
-                self._delete_by_content_hash(content_hash, user_id=user_id)
-            await self._async_upsert(content_hash, documents, filters, batch_size, user_id=user_id)
+            await asyncio.to_thread(
+                self._replace_prepared_documents,
+                content_hash,
+                documents,
+                filters,
+                batch_size,
+                user_id,
+            )
         except Exception as e:
             log_error(f"Error upserting documents by content hash: {str(e)}")
             raise
 
-    async def _async_upsert(
+    def _replace_prepared_documents(
         self,
         content_hash: str,
         documents: List[Document],
@@ -716,38 +751,22 @@ class OracleVector(VectorDb):
         batch_size: int = 100,
         user_id: Optional[str] = None,
     ) -> None:
+        """Replace already-embedded documents entirely in the worker thread."""
         try:
-            with self.Session() as sess:
-                for i in range(0, len(documents), batch_size):
-                    batch_docs = documents[i : i + batch_size]
-                    try:
-                        await self._async_embed_documents(batch_docs, prepared=True)
-                        batch_docs = retrievable_documents(batch_docs)
-                        batch_records_dict: Dict[str, Dict[str, Any]] = {}
-                        for doc in batch_docs:
-                            try:
-                                record = self._get_document_record(doc, filters, content_hash, user_id, prepared=True)
-                                batch_records_dict[record["id"]] = record
-                            except Exception as e:
-                                log_error(f"Error processing document '{doc.name}': {str(e)}")
+            self._require_owner_column(user_id)
 
-                        batch_records = [r for r in batch_records_dict.values() if r.get("embedding")]
-                        if not batch_records:
-                            log_info("No valid records to upsert in this batch.")
-                            continue
+            if self.content_hash_exists(content_hash, user_id=user_id):
+                self._delete_by_content_hash(content_hash, user_id=user_id)
 
-                        with sess.begin():
-                            merge_upsert_many(
-                                sess, self.table, ["id"], batch_records, preserve_on_conflict=["created_at"]
-                            )
-                        log_info(f"Upserted batch of {len(batch_records)} documents.")
-                    except Exception as e:
-                        log_error(f"Error with batch starting at index {i}: {str(e)}")
-                        sess.rollback()
-                        raise
-        except Exception as e:
-            log_error(f"Error upserting documents: {str(e)}")
-            raise
+            self._upsert(
+                content_hash,
+                documents,
+                filters,
+                batch_size,
+                user_id=user_id,
+            )
+        finally:
+            self.Session.remove()
 
     # -- Metadata update: per-row shallow merge, matching PgVector's ||
     # exactly (an explicit null in the incoming dict overwrites, never
@@ -796,17 +815,10 @@ class OracleVector(VectorDb):
         filters: Optional[Union[Dict[str, Any], List[FilterExpr]]] = None,
         user_id: Optional[str] = None,
     ) -> List[Document]:
-        """Search asynchronously by running in a thread.
+        """Run synchronous search in a worker without blocking the event loop.
 
-        Deliberate parity with PgVector's own approach, not an oversight: every
-        async method on this store offloads the synchronous call to a thread,
-        the same way PgVector's own async_search/async_insert/async_upsert do,
-        rather than reimplementing genuine asyncio I/O the way ticket 13's
-        storage-adapter AsyncOracleDb does. Diverging from the reference store's
-        own async strategy inside the PR that introduces this backend would be
-        review friction with no immediate benefit -- a genuinely async
-        OracleVector (an async SQLAlchemy engine, non-blocking VECTOR_DISTANCE/
-        CONTAINS queries) is a real follow-up, not implemented here.
+        Search uses the synchronous engine and embedder inside the worker.
+        This is thread-backed execution, not native asynchronous database I/O.
         """
         return await asyncio.to_thread(self.search, query, limit, filters, user_id)
 
@@ -1348,7 +1360,10 @@ class OracleVector(VectorDb):
             with self.Session() as sess, sess.begin():
                 log_debug(f"Creating Oracle Text index '{index_name}' on '{self.table.fullname}'.content")
                 sess.execute(
-                    text(f"CREATE INDEX {index_name} ON {self.table.fullname}(content) INDEXTYPE IS CTXSYS.CONTEXT")
+                    text(
+                        f"CREATE INDEX {index_name} ON {self.table.fullname}(content) "
+                        "INDEXTYPE IS CTXSYS.CONTEXT PARAMETERS ('SYNC (ON COMMIT)')"
+                    )
                 )
         except Exception as e:
             self._raise_if_text_search_unavailable(e, self.table.fullname)

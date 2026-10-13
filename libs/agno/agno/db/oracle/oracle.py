@@ -1284,22 +1284,21 @@ class OracleDb(BaseDb):
             }
 
             with self.Session() as sess, sess.begin():
-                # Owner-scoped match, mirroring Postgres's ON CONFLICT ...
-                # WHERE clause: a session_id collision only updates the
-                # existing row when it is unowned or already owned by this
-                # same user, so one user's upsert cannot silently overwrite
-                # another user's row of the same id.
-                existing = sess.execute(
-                    select(table.c.session_id, table.c.user_id).where(table.c.session_id == values["session_id"])
-                ).first()
-                if existing is not None and existing[1] is not None and existing[1] != values["user_id"]:
+                # Enforce ownership during the write: an earlier SELECT
+                # can become stale before another request commits.
+                affected = merge_upsert(
+                    sess,
+                    table,
+                    key_columns=["session_id"],
+                    values=values,
+                    owner_column="user_id",
+                )
+                if affected == 0:
                     log_warning(
-                        f"upsert_session: session_id '{values['session_id']}' is owned by a different user; "
-                        "not overwriting."
+                        f"upsert_session: session_id '{values['session_id']}' "
+                        "is owned by a different user; not overwriting."
                     )
                     return None
-
-                merge_upsert(sess, table, key_columns=["session_id"], values=values)
                 row = sess.execute(select(table).where(table.c.session_id == values["session_id"])).fetchone()
                 if row is None:
                     return None
@@ -1651,6 +1650,8 @@ class OracleDb(BaseDb):
         with self.Session() as sess:
             result = sess.execute(stmt).fetchall()
             sessions = [dict(record._mapping) for record in result]
+            for session in sessions:
+                session["user_id"] = from_db_user_id(session.get("user_id"))
 
             if runs_table is not None and sessions:
                 session_ids = [s["session_id"] for s in sessions]

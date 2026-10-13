@@ -21,8 +21,9 @@ files = DbFileSystem(db=db, table_name="agent_files")
 # OracleVector(db=db, table_name="knowledge", ...) can borrow this same pool.
 
 # ---------------------------------------------------------------------------
-# Run: inspect configuration without connecting to the database
+# Run: verify shared-engine wiring. OracleDb connects during construction
+# to detect the server's capabilities.
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    print("Oracle engine configured; no database connection opened.")
+    print("Oracle engine configured; OracleDb connected to detect server capabilities.")
     print("Filesystem shares the database engine:", files.db_engine is db.db_engine)

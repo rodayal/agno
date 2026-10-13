@@ -20,6 +20,7 @@ extend this file with their own domains as they land, rather than each
 inventing a separate differential suite.
 """
 
+import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict
@@ -46,10 +47,12 @@ from agno.session import AgentSession
 from agno.tracing.schemas import Trace
 
 PG_URL = "postgresql+psycopg://ai:ai@localhost:5532/ai"
-ORACLE_URL = "oracle+oracledb://ai:ai@localhost:1523/?service_name=FREEPDB1"
+ORACLE_URL = os.getenv("AGNO_TEST_ORACLE_URL", "")
 
 
 def _reachable(url: str) -> bool:
+    if not url:
+        return False
     engine = create_engine(url)
     try:
         with engine.connect() as conn:
@@ -66,7 +69,7 @@ def _servers_up():
     if not _reachable(PG_URL):
         pytest.skip(f"Postgres server not reachable at {PG_URL}")
     if not _reachable(ORACLE_URL):
-        pytest.skip(f"Oracle server not reachable at {ORACLE_URL}")
+        pytest.skip("AGNO_TEST_ORACLE_URL not set or Oracle is unavailable")
 
 
 @pytest.fixture
@@ -231,11 +234,12 @@ def _run_memory_metrics_knowledge_scenario(db) -> Dict[str, Any]:
     db.calculate_metrics()
     metrics_rows, _ = db.get_metrics()
     metrics_user_ids = sorted((r["user_id"] for r in metrics_rows), key=lambda v: (v is None, v))
+    unowned_metrics = next(row for row in metrics_rows if row["user_id"] is None)
 
-    # Knowledge: None means shared (visible to everyone), unlike memory/metrics
-    # where "" is the unowned-but-distinct bucket -- this is the one domain
-    # where the two states are NOT symmetric, and the harness checks that
-    # asymmetry holds identically on both backends.
+    # Knowledge: None means shared (visible to everyone). Memory preserves ""
+    # and None as distinct owner states, while metrics deliberately combines
+    # them into one unowned bucket. The harness verifies that this deliberate
+    # asymmetry behaves identically on both backends.
     db.upsert_knowledge_content(KnowledgeRow(name="diff-doc-alice", description="d", user_id="alice"))
     db.upsert_knowledge_content(KnowledgeRow(name="diff-doc-shared", description="d", user_id=None))
     _, alice_knowledge_total = db.get_knowledge_contents(user_id="alice")
@@ -246,6 +250,11 @@ def _run_memory_metrics_knowledge_scenario(db) -> Dict[str, Any]:
         "memory_stats_total": stats_total,
         "memory_stats_user_ids": stats_user_ids,
         "metrics_user_ids": metrics_user_ids,
+        "unowned_metrics": {
+            "users_count": unowned_metrics["users_count"],
+            "agent_sessions_count": unowned_metrics["agent_sessions_count"],
+            "agent_runs_count": unowned_metrics["agent_runs_count"],
+        },
         "alice_knowledge_total": alice_knowledge_total,
         "bob_knowledge_total": bob_knowledge_total,
     }
@@ -258,6 +267,11 @@ def test_memory_metrics_knowledge_owner_states_match_postgres(pg_db, oracle_db):
     """
     pg_result = _run_memory_metrics_knowledge_scenario(pg_db)
     oracle_result = _run_memory_metrics_knowledge_scenario(oracle_db)
+    assert pg_result["unowned_metrics"] == {
+        "users_count": 0,
+        "agent_sessions_count": 2,
+        "agent_runs_count": 2,
+    }
 
     assert oracle_result == pg_result, (
         f"Oracle diverged from Postgres.\nPostgres: {pg_result}\nOracle:   {oracle_result}"

@@ -626,7 +626,7 @@ def test_async_db_degrades_to_off_with_a_warning(tmp_path, monkeypatch):
     # The warning names the backend and the ones that work, not an internal filesystem error, once.
     assert len(warnings) == 1
     assert warnings[0].startswith("Result offloading is not available on AsyncSqliteDb")
-    assert "SqliteDb or PostgresDb" in warnings[0]
+    assert "SqliteDb, PostgresDb, or OracleDb" in warnings[0]
 
     # A per-request copy of the same agent stays quiet.
     agent.deep_copy().initialize_agent()
