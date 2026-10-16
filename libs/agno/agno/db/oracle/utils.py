@@ -64,14 +64,18 @@ UNOWNED_USER_ID = "__agno_unowned__"
 
 
 def to_db_user_id(user_id: Optional[str]) -> Optional[str]:
-    """Translate an agno owner value to what is stored on Oracle.
+    """Encode an owner ID for Oracle storage.
 
-    None stays None (the "every owner" / unfiltered case). "" becomes the
-    sentinel, so it survives Oracle's empty-string-is-null folding and stays
-    distinct from None. Any other value is stored unchanged.
+    None remains None; an empty string becomes the internal sentinel.
+    The literal sentinel is reserved and cannot be supplied as a user ID.
+    Other IDs remain unchanged.
     """
     if user_id is None:
         return None
+    if user_id == UNOWNED_USER_ID:
+        raise ValueError(
+            f"user_id {UNOWNED_USER_ID!r} is reserved by Oracle storage and cannot be supplied as a user ID."
+        )
     if user_id == "":
         return UNOWNED_USER_ID
     return user_id
@@ -439,6 +443,7 @@ def build_merge_statement(
     preserve_on_conflict: Sequence[str] = (),
     *,
     owner_column: Optional[str] = None,
+    fill_null_on_conflict: Sequence[str] = (),
 ):
     """Build a MERGE INTO statement upserting ``table`` on ``key_columns``.
 
@@ -464,6 +469,10 @@ def build_merge_statement(
     against a live server. Execute the returned statement with a dict of
     ``value_columns`` names to values.
 
+    ``fill_null_on_conflict`` names columns whose existing non-null value
+    is preserved on UPDATE. A NULL value is filled from the incoming row.
+    INSERT behavior is unchanged.
+
     Every column *reference* (not the bind parameter names, which follow
     their own, separate naming rules) goes through ``quote_column``, which
     defers to SQLAlchemy's own Oracle identifier preparer rather than
@@ -488,6 +497,9 @@ def build_merge_statement(
             raise ValueError("owner_column must be a non-key column included in value_columns")
     preserve_set = set(preserve_on_conflict)
     update_columns = [c for c in value_columns if c not in key_set and c not in preserve_set]
+    fill_null_set = set(fill_null_on_conflict)
+    if not fill_null_set.issubset(update_columns):
+        raise ValueError("fill_null_on_conflict must name non-key, non-preserved columns included in value_columns")
 
     def q(col: str) -> str:
         return quote_column(table, col)
@@ -501,7 +513,10 @@ def build_merge_statement(
         f"MERGE INTO {_qualified_table_name(table)} t USING (SELECT {using_select} FROM dual) s ON ({on_clause})"
     )
     if update_columns:
-        update_set = ", ".join(f"t.{q(c)} = s.{q(c)}" for c in update_columns)
+        update_set = ", ".join(
+            f"t.{q(c)} = COALESCE(t.{q(c)}, s.{q(c)})" if c in fill_null_set else f"t.{q(c)} = s.{q(c)}"
+            for c in update_columns
+        )
         merge_sql += f" WHEN MATCHED THEN UPDATE SET {update_set}"
 
         if owner_column is not None:
@@ -522,6 +537,7 @@ def merge_upsert(
     preserve_on_conflict: Sequence[str] = (),
     *,
     owner_column: Optional[str] = None,
+    fill_null_on_conflict: Sequence[str] = (),
 ) -> Optional[int]:
     """Upsert one row, optionally restricting updates by owner.
 
@@ -536,6 +552,7 @@ def merge_upsert(
         list(values.keys()),
         preserve_on_conflict=preserve_on_conflict,
         owner_column=owner_column,
+        fill_null_on_conflict=fill_null_on_conflict,
     )
     attempt = 0
     while True:
@@ -593,6 +610,7 @@ async def amerge_upsert(
     preserve_on_conflict: Sequence[str] = (),
     *,
     owner_column: Optional[str] = None,
+    fill_null_on_conflict: Sequence[str] = (),
 ) -> Optional[int]:
     """Asynchronous equivalent of the single-row merge_upsert helper."""
     stmt = build_merge_statement(
@@ -601,6 +619,7 @@ async def amerge_upsert(
         list(values.keys()),
         preserve_on_conflict=preserve_on_conflict,
         owner_column=owner_column,
+        fill_null_on_conflict=fill_null_on_conflict,
     )
     attempt = 0
     while True:

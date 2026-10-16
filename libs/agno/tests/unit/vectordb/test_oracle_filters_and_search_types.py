@@ -176,3 +176,95 @@ class TestTextIndexFreshness:
         results = db.keyword_search("Jupiter", limit=1)
 
         assert [result.name for result in results] == ["jupiter-doc"]
+
+
+def test_count_includes_unnamed_documents(db):
+    # This fixture owns a uniquely named temporary table.
+    # Remove its three sample documents, not any application data.
+    with db.db_engine.begin() as connection:
+        connection.execute(db.table.delete())
+
+    assert db.get_count() == 0
+
+    db.insert(
+        content_hash="count-unnamed",
+        documents=[
+            Document(content="First unnamed document"),
+            Document(content="Second unnamed document"),
+        ],
+    )
+    assert db.get_count() == 2
+
+    db.insert(
+        content_hash="count-named",
+        documents=[
+            Document(name="named-document", content="Third document"),
+        ],
+    )
+    assert db.get_count() == 3
+
+
+def test_numeric_metadata_update_after_reopen(db):
+    import json
+
+    from sqlalchemy import select
+
+    content_id = "numeric-metadata-regression"
+    db.insert(
+        content_hash="numeric-metadata-hash",
+        documents=[
+            Document(
+                content="A document for testing metadata updates.",
+                content_id=content_id,
+                meta_data={"views": 2, "price": 1.25, "nested": {"counts": [3, 4.5]}, "label": "123"},
+            )
+        ],
+        filters={"priority": 7},
+    )
+    reopened = OracleVector(table_name=db.table_name, db_engine=db.db_engine, embedder=DeterministicEmbedder())
+
+    def read_record():
+        with reopened.Session() as session:
+            return session.execute(
+                select(reopened.table.c.meta_data, reopened.table.c.filters, reopened.table.c.usage).where(
+                    reopened.table.c.content_id == content_id
+                )
+            ).one()
+
+    try:
+        before = read_record()
+        assert type(before.meta_data["views"]) is int
+        assert type(before.meta_data["price"]) is float
+        assert type(before.meta_data["nested"]["counts"][0]) is int
+        assert type(before.meta_data["nested"]["counts"][1]) is float
+        assert type(before.filters["priority"]) is int
+        assert type(before.usage["total_tokens"]) is int
+        json.dumps(dict(before._mapping))
+
+        patch = {"views": 5, "optional": None}
+        reopened.update_metadata(content_id, patch)
+        after = read_record()
+        assert after.meta_data == {
+            "views": 5,
+            "price": 1.25,
+            "nested": {"counts": [3, 4.5]},
+            "label": "123",
+            "priority": 7,
+            "optional": None,
+        }
+        assert after.filters == patch
+        assert after.usage == before.usage
+        assert type(after.meta_data["views"]) is int
+        assert type(after.meta_data["price"]) is float
+        json.dumps(dict(after._mapping))
+
+        # Preserve the existing shallow-merge contract: replace nested objects,
+        # rather than recursively merging them. Explicit None remains a key.
+        reopened.update_metadata(content_id, {"nested": {"replacement": 9}})
+        final = read_record()
+        assert final.meta_data == {**after.meta_data, "nested": {"replacement": 9}}
+        assert final.filters == {"nested": {"replacement": 9}}
+        json.dumps(dict(final._mapping))
+    finally:
+        # The fixture owns table/engine cleanup; this adapter borrows its engine.
+        reopened.Session.remove()

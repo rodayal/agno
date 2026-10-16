@@ -26,7 +26,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict
 
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect, text
 
 from agno.db.base import (
     ComponentArchivedError,
@@ -86,7 +86,7 @@ def pg_db(_servers_up):
 
 @pytest.fixture
 def oracle_db(_servers_up):
-    suffix = uuid.uuid4().hex[:8]
+    suffix = uuid.uuid4().hex[:12]
     tables = {
         "session_table": f"diff_sess_{suffix}",
         "runs_table": f"diff_runs_{suffix}",
@@ -98,6 +98,8 @@ def oracle_db(_servers_up):
         "learnings_table": f"diff_learn_{suffix}",
         "schedules_table": f"diff_sched_{suffix}",
         "schedule_runs_table": f"diff_sched_runs_{suffix}",
+        "spans_table": f"diff_span_{suffix}",
+        "versions_table": f"diff_ver_{suffix}",
         "approvals_table": f"diff_appr_{suffix}",
         "auth_tokens_table": f"diff_auth_{suffix}",
         "components_table": f"diff_comp_{suffix}",
@@ -112,16 +114,32 @@ def oracle_db(_servers_up):
         "mcp_oauth_keys_table": f"diff_mcpk_{suffix}",
     }
     database = OracleDb(db_url=ORACLE_URL, id=f"diff-oracle-{suffix}", **tables)
-    yield database
-    database.Session.remove()
-    with database.db_engine.begin() as conn:
-        # tool_results has no name override (ticket 11: fixed, not
-        # configurable), so it is not in `tables` above and is dropped by
-        # its own fixed name instead.
-        for t in [*tables.values(), database.tool_results_table_name]:
-            if database.table_exists(t):
-                conn.execute(text(f"DROP TABLE {t} CASCADE CONSTRAINTS"))
-    database.db_engine.dispose()
+    database.tool_results_table_name = f"diff_tool_{suffix}"
+    owned_tables = (*tables.values(), database.tool_results_table_name)
+    ownership_confirmed = False
+
+    def existing_fixture_tables(connection):
+        inspector = inspect(connection)
+        return [name for name in owned_tables if inspector.has_table(name)]
+
+    try:
+        with database.db_engine.connect() as connection:
+            preexisting = existing_fixture_tables(connection)
+
+        if preexisting:
+            raise RuntimeError(f"Refusing to reuse existing test tables: {preexisting}")
+
+        ownership_confirmed = True
+        yield database
+    finally:
+        try:
+            database.Session.remove()
+            if ownership_confirmed:
+                with database.db_engine.begin() as connection:
+                    for name in reversed(existing_fixture_tables(connection)):
+                        connection.execute(text(f"DROP TABLE {name} CASCADE CONSTRAINTS"))
+        finally:
+            database.db_engine.dispose()
 
 
 def _run_scenario(db) -> Dict[str, Any]:

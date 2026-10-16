@@ -30,7 +30,7 @@ from typing import Any, Dict
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect, text
 
 from agno.db.oracle import AsyncOracleDb
 from agno.db.postgres import AsyncPostgresDb
@@ -86,7 +86,7 @@ async def pg_db(_servers_up):
 
 @pytest_asyncio.fixture
 async def oracle_db(_servers_up):
-    suffix = uuid.uuid4().hex[:8]
+    suffix = uuid.uuid4().hex[:12]
     tables = {
         "session_table": f"adiff_sess_{suffix}",
         "runs_table": f"adiff_runs_{suffix}",
@@ -105,18 +105,32 @@ async def oracle_db(_servers_up):
         "service_accounts_table": f"adiff_svcacct_{suffix}",
     }
     database = AsyncOracleDb(db_url=ORACLE_ASYNC_URL, id=f"adiff-oracle-{suffix}", **tables)
-    yield database
-    # Table cleanup via a plain sync engine: simpler than awaiting DDL through
-    # run_sync for a one-off teardown, and this file already needs a sync
-    # engine for the reachability probe above.
-    sync_engine = create_engine(ORACLE_SYNC_URL)
-    with sync_engine.begin() as conn:
-        for t in [*tables.values(), database.tool_results_table_name]:
-            exists = conn.execute(text(f"select count(*) from user_tables where table_name = upper('{t}')")).scalar()
-            if exists:
-                conn.execute(text(f"DROP TABLE {t} CASCADE CONSTRAINTS"))
-    sync_engine.dispose()
-    await database.close()
+    database.tool_results_table_name = f"adiff_tool_{suffix}"
+    owned_tables = (*tables.values(), database.tool_results_table_name)
+    ownership_confirmed = False
+
+    def existing_fixture_tables(connection):
+        inspector = inspect(connection)
+        return [name for name in owned_tables if inspector.has_table(name)]
+
+    try:
+        async with database.db_engine.connect() as connection:
+            preexisting = await connection.run_sync(existing_fixture_tables)
+
+        if preexisting:
+            raise RuntimeError(f"Refusing to reuse existing test tables: {preexisting}")
+
+        ownership_confirmed = True
+        yield database
+    finally:
+        try:
+            if ownership_confirmed:
+                async with database.db_engine.begin() as connection:
+                    existing = await connection.run_sync(existing_fixture_tables)
+                    for name in reversed(existing):
+                        await connection.execute(text(f"DROP TABLE {name} CASCADE CONSTRAINTS"))
+        finally:
+            await database.close()
 
 
 async def _run_session_and_run_scenario(db) -> Dict[str, Any]:

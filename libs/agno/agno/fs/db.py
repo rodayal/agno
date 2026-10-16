@@ -246,27 +246,33 @@ class DbFileSystem(BaseFS):
         now = int(time.time())
         size_bytes = len(content.encode("utf-8"))
         if self.dialect == "oracle":
-            # Oracle has no INSERT ... ON CONFLICT (see the module's merge_upsert
-            # precedent in agno.db.oracle.utils, not reused here to keep this
-            # cross-backend module free of an agno.db.oracle import). MERGE
-            # covers the insert-or-update; it does not support RETURNING at
-            # all (unlike plain INSERT/UPDATE/DELETE, which Oracle's RETURNING
-            # INTO does support) -- see write()'s CAS branch, unchanged, for
-            # that distinction. So the version/size this write produced is
-            # read back with a plain SELECT in the same transaction: the
-            # MERGE's row lock is held until commit, so no concurrent writer
-            # can interleave between the two statements.
-            conn.execute(
-                sql_text(
-                    f"MERGE INTO {t.name} d USING (SELECT :ns AS ns, :p AS p FROM dual) s "
-                    "ON (d.namespace = s.ns AND d.path = s.p) "
-                    "WHEN MATCHED THEN UPDATE SET d.content = :content, d.size_bytes = :size_bytes, "
-                    "d.version = d.version + 1, d.updated_at = :now "
-                    "WHEN NOT MATCHED THEN INSERT (namespace, path, content, size_bytes, version, "
-                    "created_at, updated_at) VALUES (s.ns, s.p, :content, :size_bytes, 1, :now, :now)"
-                ),
-                {"ns": namespace, "p": path, "content": content, "size_bytes": size_bytes, "now": now},
+            from agno.db.oracle.utils import DEFAULT_MERGE_RETRY_ATTEMPTS, is_unique_violation
+
+            statement = sql_text(
+                f"MERGE INTO {t.name} d USING (SELECT :ns AS ns, :p AS p FROM dual) s "
+                "ON (d.namespace = s.ns AND d.path = s.p) "
+                "WHEN MATCHED THEN UPDATE SET d.content = :content, d.size_bytes = :size_bytes, "
+                "d.version = d.version + 1, d.updated_at = :now "
+                "WHEN NOT MATCHED THEN INSERT (namespace, path, content, size_bytes, version, "
+                "created_at, updated_at) VALUES (s.ns, s.p, :content, :size_bytes, 1, :now, :now)"
             )
+            parameters = {
+                "ns": namespace,
+                "p": path,
+                "content": content,
+                "size_bytes": size_bytes,
+                "now": now,
+            }
+
+            for attempt in range(DEFAULT_MERGE_RETRY_ATTEMPTS):
+                try:
+                    conn.execute(statement, parameters)
+                    break
+                except IntegrityError as error:
+                    if not is_unique_violation(error) or attempt == DEFAULT_MERGE_RETRY_ATTEMPTS - 1:
+                        raise
+
+            # Read metadata while the caller's transaction still holds the write lock.
             row = conn.execute(
                 select(t.c.version, t.c.size_bytes).where(and_(t.c.namespace == namespace, t.c.path == path))
             ).one()
@@ -334,25 +340,8 @@ class DbFileSystem(BaseFS):
                     )
             return FileMeta(path=path, size_bytes=row[1], version=row[0], updated_at=now)
         if self.dialect == "oracle":
-            # See _write_on's docstring: MERGE has no RETURNING, so the
-            # resulting version/size is read back with a plain SELECT inside
-            # the same transaction, after the MERGE's row lock is taken.
             with self.db_engine.begin() as conn:
-                conn.execute(
-                    sql_text(
-                        f"MERGE INTO {t.name} d USING (SELECT :ns AS ns, :p AS p FROM dual) s "
-                        "ON (d.namespace = s.ns AND d.path = s.p) "
-                        "WHEN MATCHED THEN UPDATE SET d.content = :content, d.size_bytes = :size_bytes, "
-                        "d.version = d.version + 1, d.updated_at = :now "
-                        "WHEN NOT MATCHED THEN INSERT (namespace, path, content, size_bytes, version, "
-                        "created_at, updated_at) VALUES (s.ns, s.p, :content, :size_bytes, 1, :now, :now)"
-                    ),
-                    {"ns": namespace, "p": path, "content": content, "size_bytes": size_bytes, "now": now},
-                )
-                oracle_row = conn.execute(
-                    select(t.c.version, t.c.size_bytes).where(and_(t.c.namespace == namespace, t.c.path == path))
-                ).one()
-            return FileMeta(path=path, size_bytes=oracle_row[1], version=oracle_row[0], updated_at=now)
+                return self._write_on(conn, namespace, path, content)
         insert = self._insert()
         stmt = insert(t).values(
             namespace=namespace,

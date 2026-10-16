@@ -50,6 +50,7 @@ from sqlalchemy import (
     select,
     text,
 )
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from agno.db.base import AsyncBaseDb, SessionType, _ReentrantAsyncLock
@@ -58,6 +59,7 @@ from agno.db.oracle._version import OracleCapabilities, adetect_capabilities
 from agno.db.oracle.engine import _engine_options, create_async_oracle_engine
 from agno.db.oracle.schemas import get_table_schema_definition
 from agno.db.oracle.utils import (
+    DEFAULT_MERGE_RETRY_ATTEMPTS,
     ais_table_available,
     ais_valid_table,
     amerge_upsert,
@@ -80,6 +82,7 @@ from agno.db.schemas.service_accounts import (
     validate_service_account_update,
 )
 from agno.db.utils import (
+    HISTORY_SKIP_STATUSES,
     SessionRunObjectCache,
     build_single_run_row,
     deserialize_run,
@@ -671,6 +674,8 @@ class AsyncOracleDb(AsyncBaseDb):
                     runs_table,
                     key_columns=["run_id"],
                     values=row,
+                    preserve_on_conflict=["created_at"],
+                    fill_null_on_conflict=["run_index"],
                 )
         except Exception as e:
             log_error(f"Exception upserting run to runs table: {str(e)}")
@@ -764,14 +769,11 @@ class AsyncOracleDb(AsyncBaseDb):
 
     # -- Sessions --
     async def _cascade_tool_results(self, session_ids: List[str]) -> None:
-        """Cascade result offloading on session delete: read the index rows,
-        delete their payloads, then the index rows.
+        """Remove tool-result payloads and index rows for deleted sessions.
 
-        Best-effort and outside the session delete, so a cascade failure can
-        never poison or roll back the delete itself. Mirrors
-        ``OracleDb._cascade_tool_results`` (sync, ticket 11) exactly,
-        including the deliberate absence of the Postgres/SQLite
-        ``DbFileSystem`` default-payload-table fallback.
+        Try registered filesystems, then the existing default AgentFS
+        payload table using each index row's exact namespace and path.
+        Cleanup is best-effort and runs after the session deletion commits.
         """
         if not session_ids:
             return
@@ -800,6 +802,19 @@ class AsyncOracleDb(AsyncBaseDb):
                                 removed.add((str(namespace), str(path)))
                         except Exception as e:
                             log_warning(f"Tool-result payload delete failed for {namespace}/{path}: {e}")
+            async with self.async_session_factory() as sess, sess.begin():
+                payload_table = self._default_payload_table()
+                if await ais_table_available(sess, payload_table):
+                    for _, namespace, path in rows:
+                        key = (str(namespace), str(path))
+                        if key in removed:
+                            continue
+                        result = await sess.execute(
+                            text(f"DELETE FROM {payload_table} WHERE namespace = :namespace AND path = :path"),
+                            {"namespace": key[0], "path": key[1]},
+                        )
+                        if (getattr(result, "rowcount", 0) or 0) > 0:
+                            removed.add(key)
             missing = [
                 f"{namespace}/{path}" for _, namespace, path in rows if (str(namespace), str(path)) not in removed
             ]
@@ -814,6 +829,11 @@ class AsyncOracleDb(AsyncBaseDb):
                     await sess.execute(table.delete().where(table.c.result_id.in_(result_ids[start : start + 500])))
         except Exception as e:
             log_warning(f"Tool-result cascade on session delete failed: {e}")
+
+    @staticmethod
+    def _default_payload_table() -> str:
+        """Default DbFileSystem table in the connected user's schema."""
+        return "agno_fs"
 
     # -- Tool Results (result offloading index) --
     async def upsert_tool_result(self, row: Dict[str, Any]) -> None:
@@ -998,6 +1018,8 @@ class AsyncOracleDb(AsyncBaseDb):
             stmt = (
                 select(runs_table.c.run_data)
                 .where(runs_table.c.session_id == session_id)
+                .where(runs_table.c.parent_run_id.is_(None))
+                .where(or_(runs_table.c.status.is_(None), runs_table.c.status.notin_(HISTORY_SKIP_STATUSES)))
                 .order_by(runs_table.c.run_index.desc(), runs_table.c.created_at.desc(), runs_table.c.run_id.desc())
                 .limit(limit)
             )
@@ -1516,8 +1538,15 @@ class AsyncOracleDb(AsyncBaseDb):
 
             if runs_table is not None and sessions:
                 session_ids = [s["session_id"] for s in sessions]
+                # Oracle 19c permits at most 1000 expressions per scalar
+                # IN list. OR-connected groups preserve the same membership.
                 runs_stmt = select(runs_table.c.session_id, runs_table.c.run_data).where(
-                    runs_table.c.session_id.in_(session_ids)
+                    or_(
+                        *(
+                            runs_table.c.session_id.in_(session_ids[offset : offset + 1000])
+                            for offset in range(0, len(session_ids), 1000)
+                        )
+                    )
                 )
                 runs_by_session: Dict[str, List[Dict[str, Any]]] = {}
                 runs_result = await sess.execute(runs_stmt)
@@ -1972,14 +2001,24 @@ class AsyncOracleDb(AsyncBaseDb):
             trace_dict["user_id"] = to_db_user_id(trace_dict.get("user_id"))
 
             async with self.async_session_factory() as sess, sess.begin():
-                existing_result = await sess.execute(
-                    select(table).where(table.c.trace_id == trace_dict["trace_id"]).with_for_update()
-                )
-                existing = existing_result.fetchone()
+                existing = None
+                for attempt in range(DEFAULT_MERGE_RETRY_ATTEMPTS):
+                    existing_result = await sess.execute(
+                        select(table).where(table.c.trace_id == trace_dict["trace_id"]).with_for_update()
+                    )
+                    existing = existing_result.fetchone()
+                    if existing is not None:
+                        break
+
+                    try:
+                        await sess.execute(table.insert().values(**trace_dict))
+                        return
+                    except IntegrityError as error:
+                        if not is_unique_violation(error) or attempt == DEFAULT_MERGE_RETRY_ATTEMPTS - 1:
+                            raise
 
                 if existing is None:
-                    await amerge_upsert(sess, table, key_columns=["trace_id"], values=trace_dict)
-                    return
+                    raise RuntimeError("Trace merge could not obtain an existing row")
 
                 existing_row = dict(existing._mapping)
                 new_start, new_end = trace_dict.get("start_time"), trace_dict.get("end_time")

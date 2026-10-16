@@ -5,9 +5,10 @@ Two things cannot simply be copied over, because Oracle has no equivalent:
 
 * Postgres's ``JSONB`` becomes one of two custom types depending on the
   server's detected capabilities (see ``_version.py``): a native ``JSON``
-  column on 21c and later, or a ``CLOB`` with an ``IS JSON`` check constraint
-  below that. Both round-trip Python values through the same JSON
-  serialization agno's other SQL adapters use.
+  column on 21c and later, or JSON text stored in a plain ``CLOB``
+  below that, without an ``IS JSON`` check constraint. Both round-trip
+  Python values through the same JSON serialization used by Agno's
+  other SQL adapters.
 * Postgres's bare ``String`` (unbounded, since Postgres does not require a
   declared length) becomes ``VARCHAR2(n CHAR)`` for every indexed, keyed or
   otherwise short column, and ``CLOB`` for genuinely free-form content that
@@ -111,7 +112,7 @@ def _decode_native_json(value: Any) -> Any:
 
 
 def _decode_clob_json(value: Any) -> Any:
-    """Decode a value read from the CLOB + IS JSON check column variant.
+    """Decode JSON text read from a CLOB column.
 
     Unlike the native JSON column, this physical column is always text (or a
     LOB proxy for content the driver did not inline), so it always needs

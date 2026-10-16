@@ -37,6 +37,7 @@ from sqlalchemy.types import DateTime, String, Text, TypeDecorator
 from agno.db.oracle._version import OracleCapabilities, detect_capabilities
 from agno.db.oracle.engine import create_oracle_engine
 from agno.db.oracle.utils import merge_upsert_many
+from agno.db.oracle.schemas import _decode_native_json
 from agno.exceptions import EmbeddingError
 from agno.filters import FilterExpr
 from agno.knowledge.document import Document
@@ -114,13 +115,10 @@ def _compile_oracle_vector_type(element: Any, compiler: Any, **kw: Any) -> str:
 
 
 class OracleNativeJSON(TypeDecorator):
-    """Native Oracle JSON column (requires 21c+, already guaranteed here by the
-    23ai+ floor VECTOR itself requires). Self-contained rather than reusing
-    ``agno.db.oracle.schemas.OracleNativeJSON``: this store is an independent
-    branch from ticket 02 sharing no files with the storage adapter, and a
-    plain ``sqlalchemy.types.JSON`` has no Oracle-dialect DDL rendering at all
-    (confirmed against a live server: ``UnsupportedCompilationError``, no
-    ``visit_JSON`` on Oracle's type compiler).
+    """Native Oracle JSON column for the vector store.
+
+    Uses the storage adapter's native-JSON decoder so fetched numbers
+    can be serialized again during metadata updates.
     """
 
     impl = Text
@@ -130,13 +128,7 @@ class OracleNativeJSON(TypeDecorator):
         return None if value is None else json_module.dumps(value)
 
     def process_result_value(self, value: Any, dialect: Any) -> Any:
-        # python-oracledb's thin driver can hand a native JSON column back
-        # already decoded (dict/list/str/etc.), not JSON-encoded text --
-        # matching agno.db.oracle.schemas.OracleNativeJSON's own finding
-        # against a live server. Only re-parse when it is still a JSON string.
-        if value is None or not isinstance(value, str):
-            return value
-        return json_module.loads(value)
+        return _decode_native_json(value)
 
 
 @compiles(OracleNativeJSON, "oracle")
@@ -172,11 +164,18 @@ _UNOWNED_SENTINEL = "__agno_oraclevector_unowned__"
 
 
 def _to_db_user_id(user_id: Optional[str]) -> Optional[str]:
-    """None stays None (every owner / unfiltered); "" becomes the sentinel,
-    so it survives Oracle's empty-string-is-null folding and stays distinct
-    from None; any other value is stored unchanged."""
+    """Encode an owner ID for OracleVector.
+
+    None remains None; an empty string becomes the internal sentinel.
+    The literal sentinel is reserved and cannot be supplied as a user ID.
+    Other IDs remain unchanged.
+    """
     if user_id is None:
         return None
+    if user_id == _UNOWNED_SENTINEL:
+        raise ValueError(
+            f"user_id {_UNOWNED_SENTINEL!r} is reserved by OracleVector and cannot be supplied as a user ID."
+        )
     if user_id == "":
         return _UNOWNED_SENTINEL
     return user_id
@@ -407,6 +406,7 @@ class OracleVector(VectorDb):
         return self._owner_column_exists
 
     def _require_owner_column(self, user_id: Optional[str]) -> bool:
+        _to_db_user_id(user_id)
         if self._user_id_column_exists():
             return True
         if user_id is None:
@@ -560,7 +560,7 @@ class OracleVector(VectorDb):
                 else:
                     is_rate_limit = is_rate_limit_error(e)
                 if is_rate_limit:
-                    log_error(f"Rate limit detected during batch embedding.: {str(e)}")
+                    log_error(f"Rate limit detected during batch embedding: {str(e)}")
                     raise e
                 else:
                     log_warning(f"Async batch embedding failed, falling back to individual embeddings: {str(e)}")
@@ -582,6 +582,8 @@ class OracleVector(VectorDb):
     ) -> None:
         if batch_size <= 0:
             raise ValueError("batch_size must be greater than zero")
+
+        _to_db_user_id(user_id)
 
         try:
             for i in range(0, len(documents), batch_size):
@@ -615,11 +617,7 @@ class OracleVector(VectorDb):
 
             for doc in documents:
                 try:
-                    batch_records.append(
-                        self._get_document_record(
-                            doc, filters, content_hash, user_id, prepared=True
-                        )
-                    )
+                    batch_records.append(self._get_document_record(doc, filters, content_hash, user_id, prepared=True))
                 except EmbeddingError:
                     raise
                 except Exception as e:
@@ -655,6 +653,7 @@ class OracleVector(VectorDb):
         retrievable content. Re-ingesting unchanged content does not
         duplicate it, since the record id is keyed on content hash.
         """
+        _to_db_user_id(user_id)
         for document in documents:
             if not document.embedding:
                 document.embedding = None
@@ -722,6 +721,8 @@ class OracleVector(VectorDb):
     ) -> None:
         if batch_size <= 0:
             raise ValueError("batch_size must be greater than zero")
+
+        _to_db_user_id(user_id)
 
         for document in documents:
             if not document.embedding:
@@ -1263,7 +1264,7 @@ class OracleVector(VectorDb):
     def get_count(self) -> int:
         try:
             with self.Session() as sess, sess.begin():
-                stmt = select(func.count(self.table.c.name)).select_from(self.table)
+                stmt = select(func.count()).select_from(self.table)
                 result = sess.execute(stmt).scalar()
                 return int(result) if result is not None else 0
         except Exception as e:
@@ -1321,8 +1322,9 @@ class OracleVector(VectorDb):
         metric = _DISTANCE_METRIC.get(self.distance, "COSINE")
         params_clause = ""
         if vector_index.parameters:
+            index_type = "HNSW" if isinstance(vector_index, HNSW) else "IVF"
             params_text = ", ".join(f"{k} {v}" for k, v in vector_index.parameters.items())
-            params_clause = f" PARAMETERS ('{params_text}')"
+            params_clause = f" PARAMETERS (TYPE {index_type}, {params_text})"
 
         create_index_sql = text(
             f"CREATE VECTOR INDEX {index_name} ON {self.table.fullname} (embedding) "

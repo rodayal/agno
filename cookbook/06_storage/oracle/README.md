@@ -168,3 +168,18 @@ is a deliberate, documented consequence of the mitigation, not a leak: without
 it, an explicitly unowned row would be indistinguishable from Oracle's own
 `NULL`-is-shared bucket, and would leak into every other caller's shared reads
 with no error raised.
+
+### Reserved owner IDs
+
+Oracle storage operations that use owner-sentinel encoding reserve the
+literal user ID `__agno_unowned__`. OracleVector similarly reserves
+`__agno_oraclevector_unowned__`. Callers must not supply these internal
+markers as user IDs; use `user_id=""` for an empty-string owner.
+
+This Oracle-specific restriction prevents named users from colliding with
+empty-string owners. Other valid user IDs and existing stored values remain
+unchanged.
+
+The restriction does not repair data previously affected by a collision.
+If either marker was previously used as a real user ID, review the affected
+data before attempting any correction.

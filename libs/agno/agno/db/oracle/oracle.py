@@ -1,12 +1,7 @@
-"""Oracle Database adapter.
+"""Oracle Database storage adapter.
 
-Full public surface parity with PostgresDb is built up across several
-tickets; this file starts with the domains needed to keep an Agent's
-conversation working end to end (sessions, runs, schema versioning and table
-creation) plus the differential harness proving it. Every other abstract
-method is present as an explicit stub -- the class must instantiate now, and
-each stub names the ticket that replaces it, mirroring the pattern the MySQL
-adapter already uses for its own coverage gaps.
+Stores Agno state in Oracle Database through SQLAlchemy.
+The asynchronous storage adapter is implemented in async_oracle.py.
 
 Sections below are ordered to match ``agno.db.postgres.postgres`` so the two
 files read side by side.
@@ -64,6 +59,7 @@ from agno.db.oracle._version import OracleCapabilities, detect_capabilities
 from agno.db.oracle.engine import _engine_options
 from agno.db.oracle.schemas import get_table_schema_definition
 from agno.db.oracle.utils import (
+    DEFAULT_MERGE_RETRY_ATTEMPTS,
     apply_sorting,
     calculate_date_metrics,
     db_epoch,
@@ -94,6 +90,7 @@ from agno.db.schemas.service_accounts import (
     validate_service_account_update,
 )
 from agno.db.utils import (
+    HISTORY_SKIP_STATUSES,
     SessionRunObjectCache,
     build_single_run_row,
     deserialize_run,
@@ -734,6 +731,8 @@ class OracleDb(BaseDb):
                     runs_table,
                     key_columns=["run_id"],
                     values=row,
+                    preserve_on_conflict=["created_at"],
+                    fill_null_on_conflict=["run_index"],
                 )
         except Exception as e:
             log_error(f"Exception upserting run to runs table: {str(e)}")
@@ -826,22 +825,11 @@ class OracleDb(BaseDb):
 
     # -- Sessions --
     def _cascade_tool_results(self, session_ids: List[str]) -> None:
-        """Cascade result offloading on session delete: read the index rows,
-        delete their payloads, then the index rows.
+        """Remove tool-result payloads and index rows for deleted sessions.
 
-        Best-effort and outside the session delete, so a cascade failure can
-        never poison or roll back the delete itself. Payloads are removed by
-        the exact (namespace, path) of each index row, through the
-        filesystems result stores registered on this db.
-
-        Postgres/SQLite additionally fall back to a default AgentFS payload
-        table (``agno.fs.db.DbFileSystem``) for a row with no registered
-        store. That fallback is deliberately not replicated here:
-        ``DbFileSystem`` declares its own supported-dialects list
-        (postgresql, sqlite only) and extending it is a separate, unrelated
-        undertaking from this ticket's scope (the tool_results INDEX table).
-        A row with no registered filesystem is reported, exactly as a row
-        whose registered filesystem lookup failed would be.
+        Try registered filesystems, then the existing default AgentFS
+        payload table using each index row's exact namespace and path.
+        Cleanup is best-effort and runs after the session deletion commits.
         """
         if not session_ids:
             return
@@ -869,6 +857,19 @@ class OracleDb(BaseDb):
                                 removed.add((str(namespace), str(path)))
                         except Exception as e:
                             log_warning(f"Tool-result payload delete failed for {namespace}/{path}: {e}")
+            with self.Session() as sess, sess.begin():
+                payload_table = self._default_payload_table()
+                if is_table_available(sess, payload_table):
+                    for _, namespace, path in rows:
+                        key = (str(namespace), str(path))
+                        if key in removed:
+                            continue
+                        result = sess.execute(
+                            text(f"DELETE FROM {payload_table} WHERE namespace = :namespace AND path = :path"),
+                            {"namespace": key[0], "path": key[1]},
+                        )
+                        if (getattr(result, "rowcount", 0) or 0) > 0:
+                            removed.add(key)
             missing = [
                 f"{namespace}/{path}" for _, namespace, path in rows if (str(namespace), str(path)) not in removed
             ]
@@ -883,6 +884,11 @@ class OracleDb(BaseDb):
                     sess.execute(table.delete().where(table.c.result_id.in_(result_ids[start : start + 500])))
         except Exception as e:
             log_warning(f"Tool-result cascade on session delete failed: {e}")
+
+    @staticmethod
+    def _default_payload_table() -> str:
+        """Default DbFileSystem table in the connected user's schema."""
+        return "agno_fs"
 
     # -- Tool Results (result offloading index) --
     def upsert_tool_result(self, row: Dict[str, Any]) -> None:
@@ -1071,6 +1077,8 @@ class OracleDb(BaseDb):
             stmt = (
                 select(runs_table.c.run_data)
                 .where(runs_table.c.session_id == session_id)
+                .where(runs_table.c.parent_run_id.is_(None))
+                .where(or_(runs_table.c.status.is_(None), runs_table.c.status.notin_(HISTORY_SKIP_STATUSES)))
                 .order_by(runs_table.c.run_index.desc(), runs_table.c.created_at.desc(), runs_table.c.run_id.desc())
                 .limit(limit)
             )
@@ -1378,14 +1386,6 @@ class OracleDb(BaseDb):
                     results.append(result)
         return results
 
-    # -- Not yet implemented: owned by later tickets --
-    #
-    # Every method below is a required override of an @abstractmethod on
-    # BaseDb. Each raises NotImplementedError explicitly, naming the ticket
-    # that replaces it with a real implementation -- the same pattern the
-    # MySQL adapter already uses for its own learnings stubs
-    # (mysql.py, "Learning methods (stubs)"), rather than a silent pass.
-
     # -- Memory --
     def clear_memories(self) -> None:
         try:
@@ -1680,8 +1680,15 @@ class OracleDb(BaseDb):
                 # decodes to a dict, so there is no need for a JSON-path SQL
                 # operator (Postgres's ->> has no portable Oracle equivalent
                 # across both storage variants).
+                # Oracle 19c permits at most 1000 expressions per scalar
+                # IN list. OR-connected groups preserve the same membership.
                 runs_stmt = select(runs_table.c.session_id, runs_table.c.run_data).where(
-                    runs_table.c.session_id.in_(session_ids)
+                    or_(
+                        *(
+                            runs_table.c.session_id.in_(session_ids[offset : offset + 1000])
+                            for offset in range(0, len(session_ids), 1000)
+                        )
+                    )
                 )
                 runs_by_session: Dict[str, List[Dict[str, Any]]] = {}
                 for session_id, run_data in sess.execute(runs_stmt).fetchall():
@@ -2144,13 +2151,23 @@ class OracleDb(BaseDb):
             trace_dict["user_id"] = to_db_user_id(trace_dict.get("user_id"))
 
             with self.Session() as sess, sess.begin():
-                existing = sess.execute(
-                    select(table).where(table.c.trace_id == trace_dict["trace_id"]).with_for_update()
-                ).fetchone()
+                existing = None
+                for attempt in range(DEFAULT_MERGE_RETRY_ATTEMPTS):
+                    existing = sess.execute(
+                        select(table).where(table.c.trace_id == trace_dict["trace_id"]).with_for_update()
+                    ).fetchone()
+                    if existing is not None:
+                        break
+
+                    try:
+                        sess.execute(table.insert().values(**trace_dict))
+                        return
+                    except IntegrityError as error:
+                        if not is_unique_violation(error) or attempt == DEFAULT_MERGE_RETRY_ATTEMPTS - 1:
+                            raise
 
                 if existing is None:
-                    merge_upsert(sess, table, key_columns=["trace_id"], values=trace_dict)
-                    return
+                    raise RuntimeError("Trace merge could not obtain an existing row")
 
                 existing_row = dict(existing._mapping)
                 new_start, new_end = trace_dict.get("start_time"), trace_dict.get("end_time")
