@@ -36,7 +36,12 @@ from sqlalchemy.types import DateTime, String, Text, TypeDecorator
 
 from agno.db.oracle._version import OracleCapabilities, detect_capabilities
 from agno.db.oracle.engine import create_oracle_engine
-from agno.db.oracle.utils import merge_upsert_many
+from agno.db.oracle.utils import (
+    merge_upsert_many,
+    oracle_catalog_name,
+    quote_identifier,
+    quote_table,
+)
 from agno.db.oracle.schemas import _decode_native_json
 from agno.exceptions import EmbeddingError
 from agno.filters import FilterExpr
@@ -778,7 +783,10 @@ class OracleVector(VectorDb):
         try:
             with self.Session() as sess, sess.begin():
                 rows = sess.execute(
-                    select(self.table.c.id, self.table.c.meta_data).where(self.table.c.content_id == content_id)
+                    select(self.table.c.id, self.table.c.meta_data)
+                    .where(self.table.c.content_id == content_id)
+                    .order_by(self.table.c.id)
+                    .with_for_update()
                 ).fetchall()
                 for row in rows:
                     merged = {**(row.meta_data or {}), **metadata}
@@ -1295,12 +1303,15 @@ class OracleVector(VectorDb):
     def _index_exists(self, index_name: str) -> bool:
         inspector = inspect(self.db_engine)
         indexes = inspector.get_indexes(self.table.name, schema=self.schema)
-        return any((idx["name"] or "").upper() == index_name.upper() for idx in indexes)
+        expected_name = oracle_catalog_name(index_name)
+
+        return any(idx["name"] is not None and oracle_catalog_name(idx["name"]) == expected_name for idx in indexes)
 
     def _drop_index(self, index_name: str) -> None:
         try:
             with self.Session() as sess, sess.begin():
-                sess.execute(text(f"DROP INDEX {index_name}"))
+                index_sql = quote_identifier(index_name, self.table.schema)
+                sess.execute(text(f"DROP INDEX {index_sql}"))
         except Exception as e:
             log_error(f"Error dropping index '{index_name}': {str(e)}")
             raise
@@ -1326,8 +1337,10 @@ class OracleVector(VectorDb):
             params_text = ", ".join(f"{k} {v}" for k, v in vector_index.parameters.items())
             params_clause = f" PARAMETERS (TYPE {index_type}, {params_text})"
 
+        index_sql = quote_identifier(index_name, self.table.schema)
+        table_sql = quote_table(self.table)
         create_index_sql = text(
-            f"CREATE VECTOR INDEX {index_name} ON {self.table.fullname} (embedding) "
+            f"CREATE VECTOR INDEX {index_sql} ON {table_sql} (embedding) "
             f"ORGANIZATION {organization} DISTANCE {metric} "
             f"WITH TARGET ACCURACY {vector_index.target_accuracy}{params_clause}"
         )
@@ -1358,12 +1371,15 @@ class OracleVector(VectorDb):
                 log_info(f"Skipping text index creation as index '{index_name}' already exists.")
                 return
 
+        index_sql = quote_identifier(index_name, self.table.schema)
+        table_sql = quote_table(self.table)
+
         try:
             with self.Session() as sess, sess.begin():
                 log_debug(f"Creating Oracle Text index '{index_name}' on '{self.table.fullname}'.content")
                 sess.execute(
                     text(
-                        f"CREATE INDEX {index_name} ON {self.table.fullname}(content) "
+                        f"CREATE INDEX {index_sql} ON {table_sql}(content) "
                         "INDEXTYPE IS CTXSYS.CONTEXT PARAMETERS ('SYNC (ON COMMIT)')"
                     )
                 )

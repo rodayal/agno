@@ -1154,6 +1154,7 @@ def _clone_db_with_table_overrides(
                 db_schema=source_db.db_schema,
                 id=source_db.id,
                 create_schema=source_db.create_schema,
+                json_storage=getattr(source_db, "_json_storage_override", None),
                 **overrides_filtered,
             )
     except Exception as e:

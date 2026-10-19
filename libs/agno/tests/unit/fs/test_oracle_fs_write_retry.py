@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 from sqlalchemy import BigInteger, Column, MetaData, String, Table, Text, create_engine
 from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
+from sqlalchemy.dialects import oracle
 
 import agno.fs.db as fs_module
 from agno.db.oracle.utils import DEFAULT_MERGE_RETRY_ATTEMPTS
@@ -36,6 +37,7 @@ def backend_case(monkeypatch):
     backend._ensure_table = MagicMock()
     backend.db_engine = MagicMock()
     connection = MagicMock()
+    connection.dialect = oracle.dialect()
     backend.db_engine.begin.return_value.__enter__.return_value = connection
     monkeypatch.setattr(fs_module, "time", SimpleNamespace(time=lambda: 1700000000))
     return SimpleNamespace(backend=backend, connection=connection)

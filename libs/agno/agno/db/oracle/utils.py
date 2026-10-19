@@ -7,10 +7,10 @@ length handling, unique-violation detection, and upsert via MERGE with retry.
 import hashlib
 import time
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Iterable
 from uuid import uuid4
 
-from sqlalchemy import BigInteger, Table, bindparam, case, cast, func
+from sqlalchemy import BigInteger, Table, bindparam, case, cast, func, or_
 from sqlalchemy.dialects import oracle as oracle_dialect_module
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
@@ -25,7 +25,44 @@ from agno.utils.log import log_error, log_warning
 # A dialect instance purely for identifier quoting decisions (reserved-word
 # lookup and quote-or-not), never for a live connection. Module-level:
 # quoting rules are static, not connection-specific.
-_ORACLE_IDENTIFIER_PREPARER = oracle_dialect_module.dialect().identifier_preparer
+_ORACLE_DIALECT = oracle_dialect_module.dialect()
+_ORACLE_IDENTIFIER_PREPARER = _ORACLE_DIALECT.identifier_preparer
+
+
+ORACLE_IN_LIST_LIMIT = 1000
+
+
+def oracle_in(column: ColumnElement[Any], values: Iterable[Any]) -> ColumnElement[bool]:
+    """Match bound values using scalar IN lists within Oracle 19c's limit."""
+    items = list(values)
+    if not items:
+        return column.in_([])
+
+    return or_(
+        *(
+            column.in_(items[offset : offset + ORACLE_IN_LIST_LIMIT])
+            for offset in range(0, len(items), ORACLE_IN_LIST_LIMIT)
+        )
+    )
+
+
+def oracle_catalog_name(name: str) -> str:
+    """Return the Oracle catalog spelling, not an SQL fragment."""
+    return _ORACLE_DIALECT.denormalize_name(name)
+
+
+def quote_table(table: Table) -> str:
+    """Render a table and its optional schema using Oracle quoting rules."""
+    return _ORACLE_IDENTIFIER_PREPARER.format_table(table)
+
+
+def quote_identifier(name: str, schema: Optional[str] = None) -> str:
+    """Render an identifier and its optional schema using Oracle quoting rules."""
+    rendered = _ORACLE_IDENTIFIER_PREPARER.quote(name)
+    if schema is not None:
+        rendered_schema = _ORACLE_IDENTIFIER_PREPARER.quote_schema(schema)
+        return f"{rendered_schema}.{rendered}"
+    return rendered
 
 
 def quote_column(table: Table, column: str) -> str:
@@ -226,25 +263,27 @@ def restore_json_column_types(connection: Connection, table: Table, schema_defin
 # are cheap dictionary views, unlike the V$ performance views used for version
 # detection.
 def is_table_available(session: Session, table_name: str, db_schema: Optional[str] = None) -> bool:
-    """Whether a table named ``table_name`` exists in ``db_schema`` (the
-    connecting user's own schema when ``db_schema`` is None).
+    """Check table existence using SQLAlchemy's Oracle naming rules.
 
-    Table names are compared case-insensitively via UPPER(): Oracle folds an
-    unquoted identifier to uppercase at creation, and agno always creates
-    tables unquoted, so this matches what is actually stored regardless of
-    the case the caller wrote the Python-side name in.
+    With no schema supplied, check the connecting user's own tables.
+    Catalog-query failures propagate rather than looking like absence.
     """
     try:
         if db_schema is None:
-            query = text("SELECT 1 FROM user_tables WHERE table_name = UPPER(:table_name)")
-            params: Dict[str, Any] = {"table_name": table_name}
+            query = text("SELECT 1 FROM user_tables WHERE table_name = :table_name")
+            params: Dict[str, Any] = {
+                "table_name": oracle_catalog_name(table_name),
+            }
         else:
-            query = text("SELECT 1 FROM all_tables WHERE owner = UPPER(:db_schema) AND table_name = UPPER(:table_name)")
-            params = {"db_schema": db_schema, "table_name": table_name}
+            query = text("SELECT 1 FROM all_tables WHERE owner = :db_schema AND table_name = :table_name")
+            params = {
+                "db_schema": oracle_catalog_name(db_schema),
+                "table_name": oracle_catalog_name(table_name),
+            }
         return session.execute(query, params).first() is not None
     except Exception as e:
         log_error(f"Error checking if table exists: {str(e)}")
-        return False
+        raise
 
 
 def is_valid_table(
@@ -292,16 +331,21 @@ async def ais_table_available(session: AsyncSession, table_name: str, db_schema:
     """Async twin of ``is_table_available``; identical query and semantics."""
     try:
         if db_schema is None:
-            query = text("SELECT 1 FROM user_tables WHERE table_name = UPPER(:table_name)")
-            params: Dict[str, Any] = {"table_name": table_name}
+            query = text("SELECT 1 FROM user_tables WHERE table_name = :table_name")
+            params: Dict[str, Any] = {
+                "table_name": oracle_catalog_name(table_name),
+            }
         else:
-            query = text("SELECT 1 FROM all_tables WHERE owner = UPPER(:db_schema) AND table_name = UPPER(:table_name)")
-            params = {"db_schema": db_schema, "table_name": table_name}
+            query = text("SELECT 1 FROM all_tables WHERE owner = :db_schema AND table_name = :table_name")
+            params = {
+                "db_schema": oracle_catalog_name(db_schema),
+                "table_name": oracle_catalog_name(table_name),
+            }
         result = await session.execute(query, params)
         return result.first() is not None
     except Exception as e:
         log_error(f"Error checking if table exists: {str(e)}")
-        return False
+        raise
 
 
 def _sync_get_columns(conn: Any, table_name: str, db_schema: Optional[str]) -> set:
@@ -433,7 +477,7 @@ DEFAULT_MERGE_RETRY_ATTEMPTS = 3
 
 
 def _qualified_table_name(table: Table) -> str:
-    return table.fullname if table.schema else table.name
+    return quote_table(table)
 
 
 def build_merge_statement(

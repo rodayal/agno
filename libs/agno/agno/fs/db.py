@@ -248,8 +248,9 @@ class DbFileSystem(BaseFS):
         if self.dialect == "oracle":
             from agno.db.oracle.utils import DEFAULT_MERGE_RETRY_ATTEMPTS, is_unique_violation
 
+            table_sql = conn.dialect.identifier_preparer.format_table(t)
             statement = sql_text(
-                f"MERGE INTO {t.name} d USING (SELECT :ns AS ns, :p AS p FROM dual) s "
+                f"MERGE INTO {table_sql} d USING (SELECT :ns AS ns, :p AS p FROM dual) s "
                 "ON (d.namespace = s.ns AND d.path = s.p) "
                 "WHEN MATCHED THEN UPDATE SET d.content = :content, d.size_bytes = :size_bytes, "
                 "d.version = d.version + 1, d.updated_at = :now "

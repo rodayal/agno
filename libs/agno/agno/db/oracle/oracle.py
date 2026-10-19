@@ -74,6 +74,8 @@ from agno.db.oracle.utils import (
     to_db_user_id,
     truncate_identifier,
     restore_json_column_types,
+    oracle_in,
+    oracle_catalog_name,
 )
 from agno.db.schemas.evals import EvalFilterType, EvalRunRecord, EvalType
 from agno.db.schemas.knowledge import KnowledgeRow
@@ -238,6 +240,7 @@ class OracleDb(BaseDb):
         if db_schema is not None:
             self._require_schema_exists(db_schema)
 
+        self._json_storage_override = json_storage
         if json_storage is not None:
             self.capabilities: OracleCapabilities = OracleCapabilities.override(json_storage=json_storage)
         else:
@@ -258,7 +261,7 @@ class OracleDb(BaseDb):
         with self.db_engine.connect() as conn:
             exists = (
                 conn.execute(
-                    text("SELECT 1 FROM all_users WHERE username = UPPER(:schema)"), {"schema": db_schema}
+                    text("SELECT 1 FROM all_users WHERE username = :schema"), {"schema": oracle_catalog_name(db_schema)}
                 ).first()
                 is not None
             )
@@ -521,14 +524,18 @@ class OracleDb(BaseDb):
                     with self.Session() as sess:
                         params: Dict[str, Any]
                         if self.db_schema is None:
-                            exists_query = text("SELECT 1 FROM user_indexes WHERE index_name = UPPER(:index_name)")
-                            params = {"index_name": idx.name}
+                            exists_query = text("SELECT 1 FROM user_indexes WHERE index_name = :index_name")
+                            params = {
+                                "index_name": oracle_catalog_name(idx.name),
+                            }
                         else:
                             exists_query = text(
-                                "SELECT 1 FROM all_indexes WHERE owner = UPPER(:db_schema) "
-                                "AND index_name = UPPER(:index_name)"
+                                "SELECT 1 FROM all_indexes WHERE owner = :db_schema AND index_name = :index_name"
                             )
-                            params = {"db_schema": self.db_schema, "index_name": idx.name}
+                            params = {
+                                "db_schema": oracle_catalog_name(self.db_schema),
+                                "index_name": oracle_catalog_name(idx.name),
+                            }
                         if sess.execute(exists_query, params).scalar() is not None:
                             continue
                     idx.create(self.db_engine)
@@ -817,7 +824,7 @@ class OracleDb(BaseDb):
             if table is None:
                 return
             with self.Session() as sess, sess.begin():
-                result = sess.execute(table.delete().where(table.c.run_id.in_(run_ids)))
+                result = sess.execute(table.delete().where(oracle_in(table.c.run_id, run_ids)))
             log_debug(f"Successfully deleted {result.rowcount} runs")
         except Exception as e:
             log_error(f"Error deleting runs: {str(e)}")
@@ -840,7 +847,7 @@ class OracleDb(BaseDb):
             with self.Session() as sess:
                 rows = sess.execute(
                     select(table.c.result_id, table.c.namespace, table.c.path).where(
-                        table.c.session_id.in_(session_ids)
+                        oracle_in(table.c.session_id, session_ids)
                     )
                 ).fetchall()
             if not rows:
@@ -925,7 +932,7 @@ class OracleDb(BaseDb):
         if table is None:
             return 0
         with self.Session() as sess, sess.begin():
-            result = sess.execute(table.delete().where(table.c.result_id.in_(result_ids)))
+            result = sess.execute(table.delete().where(oracle_in(table.c.result_id, result_ids)))
         return result.rowcount or 0
 
     def get_expired_tool_results(self, now: int) -> List[Dict[str, Any]]:
@@ -968,16 +975,16 @@ class OracleDb(BaseDb):
             runs_table = self._get_table(table_type="runs")
 
             with self.Session() as sess, sess.begin():
-                select_stmt = select(table.c.session_id).where(table.c.session_id.in_(session_ids))
+                select_stmt = select(table.c.session_id).where(oracle_in(table.c.session_id, session_ids))
                 if user_id is not None:
                     select_stmt = select_stmt.where(table.c.user_id == to_db_user_id(user_id))
                 deletable_ids = [row[0] for row in sess.execute(select_stmt)]
                 cascade_ids = session_ids if user_id is None else deletable_ids
 
-                result = sess.execute(table.delete().where(table.c.session_id.in_(deletable_ids)))
+                result = sess.execute(table.delete().where(oracle_in(table.c.session_id, deletable_ids)))
 
                 if runs_table is not None:
-                    runs_delete_stmt = runs_table.delete().where(runs_table.c.session_id.in_(session_ids))
+                    runs_delete_stmt = runs_table.delete().where(oracle_in(runs_table.c.session_id, session_ids))
                     if user_id is not None:
                         runs_delete_stmt = runs_delete_stmt.where(runs_table.c.user_id == to_db_user_id(user_id))
                     sess.execute(runs_delete_stmt)
@@ -1099,7 +1106,7 @@ class OracleDb(BaseDb):
             return {}
         stmt = (
             select(runs_table.c.session_id, runs_table.c.run_data)
-            .where(runs_table.c.session_id.in_(session_ids))
+            .where(oracle_in(runs_table.c.session_id, session_ids))
             .order_by(runs_table.c.run_index.asc(), runs_table.c.created_at.asc())
         )
         runs_by_session: Dict[str, List[Dict[str, Any]]] = {}
@@ -1418,7 +1425,7 @@ class OracleDb(BaseDb):
             if table is None:
                 return
             with self.Session() as sess, sess.begin():
-                stmt = table.delete().where(table.c.memory_id.in_(memory_ids))
+                stmt = table.delete().where(oracle_in(table.c.memory_id, memory_ids))
                 if user_id is not None:
                     stmt = stmt.where(table.c.user_id == to_db_user_id(user_id))
                 sess.execute(stmt)
@@ -1972,7 +1979,7 @@ class OracleDb(BaseDb):
             if table is None:
                 return
             with self.Session() as sess, sess.begin():
-                stmt = table.delete().where(table.c.run_id.in_(eval_run_ids))
+                stmt = table.delete().where(oracle_in(table.c.run_id, eval_run_ids))
                 if user_id is not None:
                     stmt = stmt.where(table.c.user_id == to_db_user_id(user_id))
                 sess.execute(stmt)
@@ -3874,7 +3881,7 @@ class OracleDb(BaseDb):
                     if child_ids:
                         child_rows = sess.execute(
                             select(components_table.c.component_id, components_table.c.deleted_at)
-                            .where(components_table.c.component_id.in_(child_ids))
+                            .where(oracle_in(components_table.c.component_id, child_ids))
                             .with_for_update()
                         ).fetchall()
                         archived_children = sorted(
@@ -3925,7 +3932,7 @@ class OracleDb(BaseDb):
                 if not include_deleted:
                     where_clauses.append(table.c.deleted_at.is_(None))
                 if exclude_component_ids:
-                    where_clauses.append(table.c.component_id.notin_(exclude_component_ids))
+                    where_clauses.append(~oracle_in(table.c.component_id, exclude_component_ids))
                 if name is not None:
                     where_clauses.append(table.c.name == name)
 
@@ -4243,7 +4250,7 @@ class OracleDb(BaseDb):
                         components_table.c.component_id == configs_table.c.component_id,
                     )
                     .where(
-                        configs_table.c.component_id.in_(component_ids),
+                        oracle_in(configs_table.c.component_id, component_ids),
                         configs_table.c.stage != DELETED_CONFIG_STAGE,
                         components_table.c.deleted_at.is_(None),
                     )
@@ -4864,7 +4871,7 @@ class OracleDb(BaseDb):
                     if child_ids:
                         child_rows = sess.execute(
                             select(components_table.c.component_id, components_table.c.deleted_at)
-                            .where(components_table.c.component_id.in_(child_ids))
+                            .where(oracle_in(components_table.c.component_id, child_ids))
                             .with_for_update()
                         ).fetchall()
                         archived_children = sorted(
@@ -5042,7 +5049,7 @@ class OracleDb(BaseDb):
         if child_ids:
             rows = sess.execute(
                 select(components_table.c.component_id, components_table.c.deleted_at).where(
-                    components_table.c.component_id.in_(child_ids)
+                    oracle_in(components_table.c.component_id, child_ids)
                 )
             ).fetchall()
             found = {r.component_id: r.deleted_at for r in rows}
@@ -5312,7 +5319,7 @@ class OracleDb(BaseDb):
                 result = sess.execute(
                     table.update()
                     .where(
-                        table.c.id.in_(job_ids),
+                        oracle_in(table.c.id, job_ids),
                         table.c.locked_by == worker_id,
                         table.c.status == "running",
                     )

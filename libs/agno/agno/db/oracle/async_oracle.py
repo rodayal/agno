@@ -19,9 +19,9 @@ Three constraints shape every method below:
   client is never initialised on this path. ``create_async_oracle_engine``
   (agno.db.oracle.engine) enforces the ``oracle+oracledb_async://`` URL that
   guarantees this, and this module never opens a sync engine or connection.
-- Version detection (ticket 02) is a sync-only helper. Capabilities are
-  resolved lazily, through a dedicated async connection, on first table
-  access -- never eagerly in ``__init__``, which cannot be a coroutine.
+- When capability detection is needed, it runs asynchronously through
+  adetect_capabilities() on first table access. Detection is deferred
+  because __init__ cannot await database I/O.
 
 Sections are ordered to match ``agno.db.oracle.oracle`` so the two files read
 side by side.
@@ -73,6 +73,8 @@ from agno.db.oracle.utils import (
     to_db_user_id,
     truncate_identifier,
     restore_json_column_types,
+    oracle_in,
+    oracle_catalog_name,
 )
 from agno.db.schemas.evals import EvalFilterType, EvalRunRecord, EvalType
 from agno.db.schemas.knowledge import KnowledgeRow
@@ -252,7 +254,8 @@ class AsyncOracleDb(AsyncBaseDb):
         actionable error naming the DBA action required."""
         async with self.db_engine.connect() as conn:
             result = await conn.execute(
-                text("SELECT 1 FROM all_users WHERE username = UPPER(:schema)"), {"schema": db_schema}
+                text("SELECT 1 FROM all_users WHERE username = :schema"),
+                {"schema": oracle_catalog_name(db_schema)},
             )
             exists = result.first() is not None
         if not exists:
@@ -430,14 +433,18 @@ class AsyncOracleDb(AsyncBaseDb):
                     async with self.async_session_factory() as sess:
                         params: Dict[str, Any]
                         if self.db_schema is None:
-                            exists_query = text("SELECT 1 FROM user_indexes WHERE index_name = UPPER(:index_name)")
-                            params = {"index_name": idx.name}
+                            exists_query = text("SELECT 1 FROM user_indexes WHERE index_name = :index_name")
+                            params = {
+                                "index_name": oracle_catalog_name(idx.name),
+                            }
                         else:
                             exists_query = text(
-                                "SELECT 1 FROM all_indexes WHERE owner = UPPER(:db_schema) "
-                                "AND index_name = UPPER(:index_name)"
+                                "SELECT 1 FROM all_indexes WHERE owner = :db_schema AND index_name = :index_name"
                             )
-                            params = {"db_schema": self.db_schema, "index_name": idx.name}
+                            params = {
+                                "db_schema": oracle_catalog_name(self.db_schema),
+                                "index_name": oracle_catalog_name(idx.name),
+                            }
                         result = await sess.execute(exists_query, params)
                         if result.scalar() is not None:
                             continue
@@ -761,7 +768,7 @@ class AsyncOracleDb(AsyncBaseDb):
             if table is None:
                 return
             async with self.async_session_factory() as sess, sess.begin():
-                result = await sess.execute(table.delete().where(table.c.run_id.in_(run_ids)))
+                result = await sess.execute(table.delete().where(oracle_in(table.c.run_id, run_ids)))
             log_debug(f"Successfully deleted {result.rowcount} runs")  # type: ignore
         except Exception as e:
             log_error(f"Error deleting runs: {str(e)}")
@@ -784,7 +791,7 @@ class AsyncOracleDb(AsyncBaseDb):
             async with self.async_session_factory() as sess:
                 result = await sess.execute(
                     select(table.c.result_id, table.c.namespace, table.c.path).where(
-                        table.c.session_id.in_(session_ids)
+                        oracle_in(table.c.session_id, session_ids)
                     )
                 )
                 rows = result.fetchall()
@@ -872,7 +879,7 @@ class AsyncOracleDb(AsyncBaseDb):
         if table is None:
             return 0
         async with self.async_session_factory() as sess, sess.begin():
-            result = await sess.execute(table.delete().where(table.c.result_id.in_(result_ids)))
+            result = await sess.execute(table.delete().where(oracle_in(table.c.result_id, result_ids)))
         return result.rowcount or 0  # type: ignore
 
     async def get_expired_tool_results(self, now: int) -> List[Dict[str, Any]]:
@@ -916,17 +923,17 @@ class AsyncOracleDb(AsyncBaseDb):
             runs_table = await self._get_table(table_type="runs")
 
             async with self.async_session_factory() as sess, sess.begin():
-                select_stmt = select(table.c.session_id).where(table.c.session_id.in_(session_ids))
+                select_stmt = select(table.c.session_id).where(oracle_in(table.c.session_id, session_ids))
                 if user_id is not None:
                     select_stmt = select_stmt.where(table.c.user_id == to_db_user_id(user_id))
                 select_result = await sess.execute(select_stmt)
                 deletable_ids = [row[0] for row in select_result]
                 cascade_ids = session_ids if user_id is None else deletable_ids
 
-                result = await sess.execute(table.delete().where(table.c.session_id.in_(deletable_ids)))
+                result = await sess.execute(table.delete().where(oracle_in(table.c.session_id, deletable_ids)))
 
                 if runs_table is not None:
-                    runs_delete_stmt = runs_table.delete().where(runs_table.c.session_id.in_(session_ids))
+                    runs_delete_stmt = runs_table.delete().where(oracle_in(runs_table.c.session_id, session_ids))
                     if user_id is not None:
                         runs_delete_stmt = runs_delete_stmt.where(runs_table.c.user_id == to_db_user_id(user_id))
                     await sess.execute(runs_delete_stmt)
@@ -1042,7 +1049,7 @@ class AsyncOracleDb(AsyncBaseDb):
             return {}
         stmt = (
             select(runs_table.c.session_id, runs_table.c.run_data)
-            .where(runs_table.c.session_id.in_(session_ids))
+            .where(oracle_in(runs_table.c.session_id, session_ids))
             .order_by(runs_table.c.run_index.asc(), runs_table.c.created_at.asc())
         )
         result = await sess.execute(stmt)
@@ -1312,7 +1319,7 @@ class AsyncOracleDb(AsyncBaseDb):
             if table is None:
                 return
             async with self.async_session_factory() as sess, sess.begin():
-                stmt = table.delete().where(table.c.memory_id.in_(memory_ids))
+                stmt = table.delete().where(oracle_in(table.c.memory_id, memory_ids))
                 if user_id is not None:
                     stmt = stmt.where(table.c.user_id == to_db_user_id(user_id))
                 await sess.execute(stmt)
@@ -1831,7 +1838,7 @@ class AsyncOracleDb(AsyncBaseDb):
             if table is None:
                 return
             async with self.async_session_factory() as sess, sess.begin():
-                stmt = table.delete().where(table.c.run_id.in_(eval_run_ids))
+                stmt = table.delete().where(oracle_in(table.c.run_id, eval_run_ids))
                 if user_id is not None:
                     stmt = stmt.where(table.c.user_id == to_db_user_id(user_id))
                 await sess.execute(stmt)
