@@ -14,9 +14,8 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import make_url
-
-from tests.integration.db import test_differential_async_oracle_postgres as async_module
-from tests.integration.db import test_differential_oracle_postgres as sync_module
+from tests.integration.db.oracle import test_differential_async_oracle_postgres as async_module
+from tests.integration.db.oracle import test_differential_oracle_postgres as sync_module
 
 
 @pytest.fixture

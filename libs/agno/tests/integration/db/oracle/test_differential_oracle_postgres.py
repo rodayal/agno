@@ -26,8 +26,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict
 
 import pytest
-from sqlalchemy import create_engine, inspect, text
-
 from agno.db.base import (
     ComponentArchivedError,
     ComponentCycleError,
@@ -45,6 +43,7 @@ from agno.run.agent import RunOutput
 from agno.run.base import RunStatus
 from agno.session import AgentSession
 from agno.tracing.schemas import Trace
+from sqlalchemy import create_engine, inspect, text
 
 PG_URL = "postgresql+psycopg://ai:ai@localhost:5532/ai"
 ORACLE_URL = os.getenv("AGNO_TEST_ORACLE_URL", "")

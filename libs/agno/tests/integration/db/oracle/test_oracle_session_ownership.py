@@ -6,13 +6,10 @@ import threading
 import uuid
 from types import SimpleNamespace
 
-import pytest
-import pytest_asyncio
-from sqlalchemy import inspect, select, text
-from sqlalchemy.engine import make_url
-
 import agno.db.oracle.async_oracle as async_module
 import agno.db.oracle.oracle as sync_module
+import pytest
+import pytest_asyncio
 from agno.db.oracle import AsyncOracleDb, OracleDb
 from agno.db.oracle.engine import (
     create_async_oracle_engine,
@@ -20,6 +17,8 @@ from agno.db.oracle.engine import (
 )
 from agno.db.oracle.utils import to_db_user_id
 from agno.session import AgentSession
+from sqlalchemy import inspect, select, text
+from sqlalchemy.engine import make_url
 
 
 async def _save(store, session_id, owner, message):

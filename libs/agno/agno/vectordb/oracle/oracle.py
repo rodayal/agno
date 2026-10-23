@@ -22,7 +22,7 @@ a native asynchronous database implementation remains a follow-up.
 import array
 import asyncio
 import json as json_module
-from hashlib import md5
+from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, cast
 
 from sqlalchemy import and_, bindparam, func, literal_column, not_, or_, select, text
@@ -81,7 +81,7 @@ _DISTANCE_METRIC = {
 # this store is an independent branch from ticket 02 sharing no files with the
 # storage adapter, and these are small, one-off decisions, not a shared table
 # of constants worth cross-importing.
-_WIDTH_ID = 128  # record id: always a 32-hex-char md5 digest, generous headroom
+_WIDTH_ID = 128  # record id: a 64-hex-character SHA-256 digest, with headroom
 _WIDTH_NAME = 500  # document name (often a filename or URL)
 _WIDTH_HASH = 128  # content_hash, content_id
 
@@ -459,17 +459,20 @@ class OracleVector(VectorDb):
     # -- Record identity: base id + content hash + owner, two-stage digest --
 
     def _scoped_record_id(self, base_id: str, content_hash: str, user_id: Optional[str]) -> str:
-        """Fold base id, content hash and owner into a fixed-length digest, matching
-        PgVector's own two-stage scheme: differently-partitioned inputs cannot collide
-        (a document named with a trailing fragment cannot collide with another whose
-        owner happens to supply that fragment), since each stage hashes its own
-        concatenation rather than joining raw strings with a separator a caller's own
-        data could also contain.
+        """Hash document identity with unambiguous field boundaries.
+
+        JSON keeps base_id and content_hash distinct even when they contain
+        underscores. Retain the existing second-stage owner digest, using
+        full 64-character SHA-256 IDs at both stages.
+
+        Generated values differ from both earlier MD5-based encodings.
+        Existing populated tables need an explicit migration/re-ingestion plan.
         """
-        record_id = md5(f"{base_id}_{content_hash}".encode()).hexdigest()
+        identity = json_module.dumps([base_id, content_hash], separators=(",", ":"))
+        record_id = sha256(identity.encode("utf-8")).hexdigest()
         if user_id is None:
             return record_id
-        return md5(f"{record_id}_{user_id}".encode()).hexdigest()
+        return sha256(f"{record_id}_{user_id}".encode()).hexdigest()
 
     def _get_document_record(
         self,
@@ -483,7 +486,7 @@ class OracleVector(VectorDb):
         if not prepared or not doc.embedding:
             doc.embed(embedder=self.embedder)
         cleaned_content = self._clean_content(doc.content)
-        base_id = doc.id or md5(cleaned_content.encode()).hexdigest()
+        base_id = doc.id or sha256(cleaned_content.encode()).hexdigest()
         record_id = self._scoped_record_id(base_id, content_hash, user_id)
 
         meta_data = doc.meta_data or {}

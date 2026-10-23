@@ -5,13 +5,12 @@ import os
 import uuid
 
 import pytest
-from sqlalchemy import MetaData, Table, inspect, select, text
-from sqlalchemy.engine import make_url
-
 from agno.db.oracle import AsyncOracleDb, OracleDb
 from agno.db.oracle._version import detect_capabilities
 from agno.db.oracle.engine import create_async_oracle_engine, create_oracle_engine
 from agno.db.oracle.schemas import OracleClobJSON, OracleNativeJSON
+from sqlalchemy import MetaData, Table, inspect, select, text
+from sqlalchemy.engine import make_url
 
 
 def assert_json_value(actual, expected):

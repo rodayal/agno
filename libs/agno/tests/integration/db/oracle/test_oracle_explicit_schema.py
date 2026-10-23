@@ -5,12 +5,11 @@ import os
 import uuid
 
 import pytest
+from agno.db.oracle import AsyncOracleDb, OracleDb
+from agno.db.oracle.engine import create_async_oracle_engine, create_oracle_engine
 from sqlalchemy import MetaData, Table, inspect, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
-
-from agno.db.oracle import AsyncOracleDb, OracleDb
-from agno.db.oracle.engine import create_async_oracle_engine, create_oracle_engine
 
 
 @pytest.mark.asyncio

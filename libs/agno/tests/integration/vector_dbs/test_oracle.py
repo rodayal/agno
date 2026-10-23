@@ -1,29 +1,23 @@
-"""Differential ranking harness: OracleVector vs PgVector.
-
-Ticket 17's own acceptance criterion: the same corpus and query, embedded
-with the same deterministic offline embedder (no API key needed), must
-produce the same top-k ordering on both backends. PgVector is the reference
-implementation for OracleVector (see OracleVector's own module docstring);
-this is the vector-similarity-only differential, matching this ticket's own
-scope (keyword/hybrid search is ticket 18's).
-
-Both fixtures skip cleanly (not error) when their server is unreachable,
-matching the sync storage-adapter harness's own convention (ADR 0009: no
-Oracle container in public CI).
-"""
+"""Oracle regression tests grouped by behavior; no cases are discarded."""
 
 import os
 import uuid
 from hashlib import md5
+from inspect import isawaitable
 from typing import Any, Dict, List
+from uuid import uuid4
 
 import pytest
-from sqlalchemy import create_engine, text
-
+from agno.db.oracle._version import detect_capabilities
 from agno.knowledge.document import Document
 from agno.vectordb.distance import Distance
 from agno.vectordb.oracle import OracleVector
 from agno.vectordb.pgvector import PgVector
+from sqlalchemy import create_engine, select, text
+from sqlalchemy.engine import make_url
+from sqlalchemy.inspection import inspect
+
+# PostgreSQL ranking parity
 
 PG_URL = "postgresql+psycopg://ai:ai@localhost:5532/ai"
 ORACLE_URL = os.getenv("AGNO_TEST_ORACLE_URL", "")
@@ -216,3 +210,104 @@ def test_hybrid_search_ranking_matches_postgres(pg_db, oracle_db):
     assert oracle_result == pg_result, (
         f"OracleVector hybrid search diverged from PgVector.\nPostgres: {pg_result}\nOracle:   {oracle_result}"
     )
+
+
+# Oracle record identity
+
+
+class LocalEmbedder:
+    dimensions = 3
+    enable_batch = False
+
+    def get_embedding_and_usage(self, content):
+        return [1.0, 0.0, 0.0], {"total_tokens": 0}
+
+    async def async_get_embedding_and_usage(self, content):
+        return self.get_embedding_and_usage(content)
+
+
+@pytest.fixture
+def store():
+    db_url = os.getenv("AGNO_TEST_ORACLE_URL", "")
+    if not db_url:
+        pytest.skip("AGNO_TEST_ORACLE_URL is not configured")
+    if make_url(db_url).drivername != "oracle+oracledb":
+        pytest.fail("This test requires a synchronous Oracle connection URL")
+
+    engine = create_engine(db_url, hide_parameters=True)
+    database = None
+    created = False
+    table_name = "test_oid_" + uuid4().hex[:12]
+    try:
+        if not detect_capabilities(engine).vector:
+            pytest.skip("Oracle 23ai+ vector support is required")
+        if inspect(engine).has_table(table_name):
+            pytest.fail("Refusing to reuse a pre-existing table")
+        database = OracleVector(table_name=table_name, db_engine=engine, embedder=LocalEmbedder())
+        database.create()
+        created = True
+        yield database
+    finally:
+        try:
+            if database is not None:
+                database.Session.remove()
+            if created:
+                database.table.drop(engine, checkfirst=False)
+                assert not inspect(engine).has_table(table_name), "Temporary table cleanup failed"
+        finally:
+            engine.dispose()
+
+
+async def write(store, method, base_id, content_hash, owner, name, content):
+    result = getattr(store, method)(
+        content_hash=content_hash,
+        documents=[Document(id=base_id, name=name, content=content)],
+        user_id=owner,
+    )
+    if isawaitable(result):
+        await result
+
+
+def snapshot(store):
+    with store.db_engine.connect() as conn:
+        rows = (
+            conn.execute(
+                select(
+                    store.table.c.id,
+                    store.table.c.name,
+                    store.table.c.content,
+                    store.table.c.content_hash,
+                    store.table.c.user_id,
+                )
+            )
+            .mappings()
+            .all()
+        )
+    result = {(row["user_id"], row["content_hash"]): dict(row) for row in rows}
+    assert len(result) == len(rows), "Duplicate records for one test identity"
+    return result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["insert", "upsert", "async_insert", "async_upsert"])
+async def test_distinct_hash_fields_survive_and_updates_preserve_other_records(store, method):
+    await write(store, method, "a_b", "c", "alice", "first-alice", "Synthetic first document")
+    await write(store, method, "a", "b_c", "alice", "second-alice", "Synthetic second document")
+    await write(store, method, "a_b", "c", "bob", "bob-control", "Synthetic first document")
+
+    before = snapshot(store)
+    assert set(before) == {("alice", "c"), ("alice", "b_c"), ("bob", "c")}
+    assert len({row["id"] for row in before.values()}) == 3
+    assert all(len(row["id"]) == 64 for row in before.values())
+    assert store.get_count() == 3
+
+    update_method = "async_upsert" if method.startswith("async_") else "upsert"
+    for _ in range(2):
+        await write(store, update_method, "a_b", "c", "alice", "first-alice", "Synthetic revised document")
+        after = snapshot(store)
+        assert set(after) == set(before)
+        assert store.get_count() == 3
+        assert after[("alice", "c")]["id"] == before[("alice", "c")]["id"]
+        assert after[("alice", "c")]["content"] == "Synthetic revised document"
+        assert after[("alice", "b_c")] == before[("alice", "b_c")]
+        assert after[("bob", "c")] == before[("bob", "c")]

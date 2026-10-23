@@ -30,8 +30,6 @@ from typing import Any, Dict
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import create_engine, inspect, text
-
 from agno.db.oracle import AsyncOracleDb
 from agno.db.postgres import AsyncPostgresDb
 from agno.db.schemas.evals import EvalRunRecord
@@ -41,6 +39,7 @@ from agno.run.agent import RunOutput
 from agno.run.base import RunStatus
 from agno.session import AgentSession
 from agno.tracing.schemas import Span, Trace
+from sqlalchemy import create_engine, inspect, text
 
 PG_URL = "postgresql+psycopg://ai:ai@localhost:5532/ai"
 PG_ASYNC_URL = "postgresql+psycopg_async://ai:ai@localhost:5532/ai"

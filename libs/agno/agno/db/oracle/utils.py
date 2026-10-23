@@ -172,15 +172,15 @@ def truncate_identifier(name: str, max_length: int = MAX_IDENTIFIER_LENGTH) -> s
     """Keep a generated Oracle identifier within ``max_length`` bytes.
 
     Returns ``name`` unchanged when it already fits. Otherwise truncates it
-    and appends a short deterministic hash of the full original name, so that
-    two different long names sharing a common prefix cannot collide after
-    truncation the way a bare truncation would.
+    and appends a short deterministic SHA-256 suffix of the full original
+    name. This reduces clashes between long names sharing a prefix; a short
+    suffix does not guarantee uniqueness.
     """
     encoded = name.encode("utf-8")
     if len(encoded) <= max_length:
         return name
 
-    digest = hashlib.sha1(encoded).hexdigest()[:8]
+    digest = hashlib.sha256(encoded).hexdigest()[:8]
     budget = max_length - len(digest) - 1  # -1 for the separator
     truncated = encoded[:budget].decode("utf-8", errors="ignore")
     return f"{truncated}_{digest}"

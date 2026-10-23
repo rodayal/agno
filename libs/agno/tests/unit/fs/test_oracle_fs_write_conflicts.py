@@ -3,16 +3,15 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import pytest
-from sqlalchemy import BigInteger, Column, MetaData, String, Table, Text, create_engine
-from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
-from sqlalchemy.dialects import oracle
-
 import agno.fs.db as fs_module
+import pytest
 from agno.db.oracle.utils import DEFAULT_MERGE_RETRY_ATTEMPTS
 from agno.fs.db import DbFileSystem
 from agno.fs.errors import VersionConflictError
 from agno.fs.types import FileMeta
+from sqlalchemy import BigInteger, Column, MetaData, String, Table, Text, create_engine
+from sqlalchemy.dialects import oracle
+from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
 
 
 def oracle_integrity_error(code):
