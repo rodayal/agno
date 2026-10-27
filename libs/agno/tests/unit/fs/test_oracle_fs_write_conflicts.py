@@ -46,6 +46,10 @@ def readback(version, content):
     return SimpleNamespace(one=lambda: (version, len(content.encode("utf-8"))))
 
 
+def update_result(version=None):
+    return SimpleNamespace(first=lambda: None if version is None else (version,))
+
+
 def assert_no_transaction_management(case):
     case.connection.commit.assert_not_called()
     case.connection.rollback.assert_not_called()
@@ -59,58 +63,103 @@ def assert_no_transaction_management(case):
 @pytest.mark.parametrize("content", ["hello", "", "café🙂"])
 def test_success_reads_metadata_once_and_preserves_bound_values(backend_case, content):
     case = backend_case
-    case.connection.execute.side_effect = [object(), readback(1, content)]
+    case.connection.execute.side_effect = [update_result(), object(), readback(1, content)]
     meta = case.backend._write_on(case.connection, "shared-work", "report.txt", content)
     assert meta == FileMeta(
         path="report.txt", version=1, size_bytes=len(content.encode("utf-8")), updated_at=1700000000
     )
     calls = case.connection.execute.call_args_list
-    assert len(calls) == 2
-    assert str(calls[0].args[0]).startswith("MERGE INTO unit_files")
-    assert "d.version = d.version + 1" in str(calls[0].args[0])
-    assert calls[0].args[1] == {
-        "ns": "shared-work",
-        "p": "report.txt",
+    assert len(calls) == 3
+    assert calls[0].args[0].is_update
+    assert calls[1].args[0].is_insert
+    assert "version=(unit_files.version +" in str(calls[0].args[0])
+    assert calls[1].args[0].compile().params == {
+        "namespace": "shared-work",
+        "path": "report.txt",
         "content": content,
         "size_bytes": len(content.encode("utf-8")),
-        "now": 1700000000,
+        "version": 1,
+        "created_at": 1700000000,
+        "updated_at": 1700000000,
     }
-    assert calls[1].args[0].is_select
+    assert calls[2].args[0].is_select
+    assert_no_transaction_management(case)
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["", "x" * 22702, "x" * 32767, "x" * 32768, "x" * 68115, "café🙂" * 7000],
+    ids=["empty", "22kb", "32767", "32768", "66kb", "unicode"],
+)
+def test_content_writes_keep_column_type_and_do_not_use_raw_sql(backend_case, content):
+    case = backend_case
+
+    def execute(statement, *args):
+        if getattr(statement, "is_select", False):
+            return readback(1, content)
+        return update_result() if getattr(statement, "is_update", False) else object()
+
+    case.connection.execute.side_effect = execute
+    case.backend._write_on(case.connection, "unit", "large.txt", content)
+    for call in case.connection.execute.call_args_list[:2]:
+        compiled = call.args[0].compile(dialect=oracle.dialect())
+        assert not compiled.isplaintext
+        assert isinstance(compiled.binds["content"].type, Text)
+        assert compiled.params["content"] == content
+        assert content not in str(compiled) or not content
+    assert_no_transaction_management(case)
+
+
+def test_existing_file_updates_without_attempting_insert(backend_case):
+    case = backend_case
+    case.connection.execute.side_effect = [update_result(2), readback(2, "Draft B")]
+    meta = case.backend._write_on(case.connection, "unit", "report.txt", "Draft B")
+    assert meta.version == 2
+    assert [call.args[0].is_update for call in case.connection.execute.call_args_list] == [True, False]
     assert_no_transaction_management(case)
 
 
 def test_unique_conflict_retries_same_statement_on_same_connection(backend_case):
     case = backend_case
-    case.connection.execute.side_effect = [oracle_integrity_error(1), object(), readback(2, "Draft B")]
+    case.connection.execute.side_effect = [
+        update_result(),
+        oracle_integrity_error(1),
+        update_result(2),
+        readback(2, "Draft B"),
+    ]
     meta = case.backend._write_on(case.connection, "shared-work", "report.txt", "Draft B")
     assert meta.version == 2
     assert meta.size_bytes == 7
     calls = case.connection.execute.call_args_list
-    assert len(calls) == 3
-    assert calls[0].args[0] is calls[1].args[0]
-    assert calls[0].args[1] is calls[1].args[1]
-    assert calls[2].args[0].is_select
+    assert len(calls) == 4
+    assert calls[0].args[0] is calls[2].args[0]
+    assert calls[1].args[0].is_insert
+    assert calls[3].args[0].is_select
     assert_no_transaction_management(case)
 
 
 def test_final_allowed_attempt_can_succeed(backend_case):
     case = backend_case
-    errors = [oracle_integrity_error(1) for _ in range(DEFAULT_MERGE_RETRY_ATTEMPTS - 1)]
-    case.connection.execute.side_effect = [*errors, object(), readback(2, "Draft B")]
-    assert case.backend._write_on(case.connection, "shared-work", "report.txt", "Draft B").version == 2
-    assert case.connection.execute.call_count == DEFAULT_MERGE_RETRY_ATTEMPTS + 1
+    attempts = [
+        item for _ in range(DEFAULT_MERGE_RETRY_ATTEMPTS - 1) for item in (update_result(), oracle_integrity_error(1))
+    ]
+    case.connection.execute.side_effect = [*attempts, update_result(), object(), readback(1, "Draft B")]
+    assert case.backend._write_on(case.connection, "shared-work", "report.txt", "Draft B").version == 1
+    assert case.connection.execute.call_count == DEFAULT_MERGE_RETRY_ATTEMPTS * 2 + 1
     assert_no_transaction_management(case)
 
 
 def test_exhausted_retries_raise_original_error_without_readback(backend_case):
     case = backend_case
     error = oracle_integrity_error(1)
-    case.connection.execute.side_effect = error
+    case.connection.execute.side_effect = [
+        item for _ in range(DEFAULT_MERGE_RETRY_ATTEMPTS) for item in (update_result(), error)
+    ]
     with pytest.raises(IntegrityError) as caught:
         case.backend._write_on(case.connection, "shared-work", "report.txt", "Draft B")
     assert caught.value is error
-    assert case.connection.execute.call_count == DEFAULT_MERGE_RETRY_ATTEMPTS
-    assert all(str(call.args[0]).startswith("MERGE INTO") for call in case.connection.execute.call_args_list)
+    assert case.connection.execute.call_count == DEFAULT_MERGE_RETRY_ATTEMPTS * 2
+    assert not any(call.args[0].is_select for call in case.connection.execute.call_args_list)
     assert_no_transaction_management(case)
 
 
@@ -118,11 +167,11 @@ def test_exhausted_retries_raise_original_error_without_readback(backend_case):
 def test_other_integrity_errors_are_not_retried(backend_case, code):
     case = backend_case
     error = oracle_integrity_error(code)
-    case.connection.execute.side_effect = error
+    case.connection.execute.side_effect = [update_result(), error]
     with pytest.raises(IntegrityError) as caught:
         case.backend._write_on(case.connection, "shared-work", "report.txt", "Draft B")
     assert caught.value is error
-    assert case.connection.execute.call_count == 1
+    assert case.connection.execute.call_count == 2
     assert_no_transaction_management(case)
 
 
@@ -135,20 +184,21 @@ def test_other_integrity_errors_are_not_retried(backend_case, code):
     ],
     ids=["application", "connection", "invalid-sql"],
 )
-def test_non_integrity_errors_are_not_retried(backend_case, error):
+@pytest.mark.parametrize("stage", ["update", "insert"])
+def test_non_integrity_errors_are_not_retried(backend_case, error, stage):
     case = backend_case
-    case.connection.execute.side_effect = error
+    case.connection.execute.side_effect = error if stage == "update" else [update_result(), error]
     with pytest.raises(type(error)) as caught:
         case.backend._write_on(case.connection, "shared-work", "report.txt", "Draft B")
     assert caught.value is error
-    assert case.connection.execute.call_count == 1
+    assert case.connection.execute.call_count == (1 if stage == "update" else 2)
     assert_no_transaction_management(case)
 
 
 def test_metadata_read_error_does_not_repeat_the_write(backend_case):
     case = backend_case
     error = oracle_integrity_error(1)
-    case.connection.execute.side_effect = [object(), error]
+    case.connection.execute.side_effect = [update_result(2), error]
     with pytest.raises(IntegrityError) as caught:
         case.backend._write_on(case.connection, "shared-work", "report.txt", "Draft B")
     assert caught.value is error

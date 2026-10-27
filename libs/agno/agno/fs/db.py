@@ -248,26 +248,31 @@ class DbFileSystem(BaseFS):
         if self.dialect == "oracle":
             from agno.db.oracle.utils import DEFAULT_MERGE_RETRY_ATTEMPTS, is_unique_violation
 
-            table_sql = conn.dialect.identifier_preparer.format_table(t)
-            statement = sql_text(
-                f"MERGE INTO {table_sql} d USING (SELECT :ns AS ns, :p AS p FROM dual) s "
-                "ON (d.namespace = s.ns AND d.path = s.p) "
-                "WHEN MATCHED THEN UPDATE SET d.content = :content, d.size_bytes = :size_bytes, "
-                "d.version = d.version + 1, d.updated_at = :now "
-                "WHEN NOT MATCHED THEN INSERT (namespace, path, content, size_bytes, version, "
-                "created_at, updated_at) VALUES (s.ns, s.p, :content, :size_bytes, 1, :now, :now)"
+            # Core DML retains the content column's large-text binding. Raw
+            # text MERGE bypasses Oracle input-size setup and fails for large
+            # strings. RETURNING distinguishes an updated row from an absent
+            # row without relying on driver-specific rowcount behavior.
+            update_statement = (
+                update(t)
+                .where(t.c.namespace == namespace, t.c.path == path)
+                .values(content=content, size_bytes=size_bytes, version=t.c.version + 1, updated_at=now)
+                .returning(t.c.version)
             )
-            parameters = {
-                "ns": namespace,
-                "p": path,
-                "content": content,
-                "size_bytes": size_bytes,
-                "now": now,
-            }
+            insert_statement = t.insert().values(
+                namespace=namespace,
+                path=path,
+                content=content,
+                size_bytes=size_bytes,
+                version=1,
+                created_at=now,
+                updated_at=now,
+            )
 
             for attempt in range(DEFAULT_MERGE_RETRY_ATTEMPTS):
+                if conn.execute(update_statement).first() is not None:
+                    break
                 try:
-                    conn.execute(statement, parameters)
+                    conn.execute(insert_statement)
                     break
                 except IntegrityError as error:
                     if not is_unique_violation(error) or attempt == DEFAULT_MERGE_RETRY_ATTEMPTS - 1:

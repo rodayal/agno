@@ -2,7 +2,7 @@
 
 import os
 import uuid
-from hashlib import md5
+from hashlib import sha256
 from inspect import isawaitable
 from typing import Any, Dict, List
 from uuid import uuid4
@@ -37,7 +37,7 @@ class _CorpusEmbedder:
         words = text.lower().split()
         vec = [0.0] * self.dimensions
         for w in words:
-            vec[int(md5(w.encode()).hexdigest(), 16) % self.dimensions] += 1.0
+            vec[int(sha256(w.encode()).hexdigest(), 16) % self.dimensions] += 1.0
         norm = sum(v * v for v in vec) ** 0.5
         return [v / norm for v in vec] if norm else vec
 
