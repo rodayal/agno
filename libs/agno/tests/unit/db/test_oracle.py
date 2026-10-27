@@ -843,9 +843,9 @@ async def test_fresh_adapter_deletes_by_bound_namespace_and_path(cleanup_case):
     await case.run()
     assert len(case.payload_calls) == 1
     sql, parameters = case.payload_calls[0]
-    assert sql == "DELETE FROM agno_fs WHERE namespace = :namespace AND path = :path"
+    assert sql == "DELETE FROM agno_fs WHERE namespace = :namespace AND path = :path AND user_id = :user_id"
     assert namespace not in sql and path not in sql
-    assert parameters == {"namespace": namespace, "path": path}
+    assert parameters == {"namespace": namespace, "path": path, "user_id": "s:"}
     # The filesystem default is not qualified with the session-table schema.
     assert case.exists.call_args.args == (case.session, "agno_fs")
     assert len(case.index_calls) == 1

@@ -37,7 +37,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as SQLASession
 from sqlalchemy.orm import scoped_session, sessionmaker
 
-from agno.db import mcp_oauth_store
+from agno.db.sql import mcp_oauth as mcp_oauth_store
 from agno.db.base import (
     DELETED_CONFIG_STAGE,
     PIN_LINK_KINDS,
@@ -867,13 +867,18 @@ class OracleDb(BaseDb):
             with self.Session() as sess, sess.begin():
                 payload_table = self._default_payload_table()
                 if is_table_available(sess, payload_table):
+                    from agno.fs.db import _ORACLE_SHARED_USER_ID
+
                     for _, namespace, path in rows:
                         key = (str(namespace), str(path))
                         if key in removed:
                             continue
                         result = sess.execute(
-                            text(f"DELETE FROM {payload_table} WHERE namespace = :namespace AND path = :path"),
-                            {"namespace": key[0], "path": key[1]},
+                            text(
+                                f"DELETE FROM {payload_table} WHERE namespace = :namespace AND path = :path "
+                                "AND user_id = :user_id"
+                            ),
+                            {"namespace": key[0], "path": key[1], "user_id": _ORACLE_SHARED_USER_ID},
                         )
                         if (getattr(result, "rowcount", 0) or 0) > 0:
                             removed.add(key)

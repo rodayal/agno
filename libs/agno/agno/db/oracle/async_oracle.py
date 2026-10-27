@@ -812,13 +812,18 @@ class AsyncOracleDb(AsyncBaseDb):
             async with self.async_session_factory() as sess, sess.begin():
                 payload_table = self._default_payload_table()
                 if await ais_table_available(sess, payload_table):
+                    from agno.fs.db import _ORACLE_SHARED_USER_ID
+
                     for _, namespace, path in rows:
                         key = (str(namespace), str(path))
                         if key in removed:
                             continue
                         result = await sess.execute(
-                            text(f"DELETE FROM {payload_table} WHERE namespace = :namespace AND path = :path"),
-                            {"namespace": key[0], "path": key[1]},
+                            text(
+                                f"DELETE FROM {payload_table} WHERE namespace = :namespace AND path = :path "
+                                "AND user_id = :user_id"
+                            ),
+                            {"namespace": key[0], "path": key[1], "user_id": _ORACLE_SHARED_USER_ID},
                         )
                         if (getattr(result, "rowcount", 0) or 0) > 0:
                             removed.add(key)

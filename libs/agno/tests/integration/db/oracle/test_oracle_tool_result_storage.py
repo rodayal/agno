@@ -8,14 +8,14 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import MetaData, Table, create_engine, event, func, inspect, select, text, update
+from sqlalchemy import Column, MetaData, Table, create_engine, event, func, inspect, select, text, update
 from sqlalchemy.engine import make_url
 
 from agno.db.oracle import OracleDb
 from agno.db.oracle.utils import is_unique_violation
 from agno.fs import FileSystem
-from agno.fs.db import DbFileSystem
-from agno.fs.errors import QuotaExceededError, VersionConflictError
+from agno.fs.db import AsyncDbFileSystem, DbFileSystem
+from agno.fs.errors import QuotaExceededError, SchemaOutdatedError, VersionConflictError
 from agno.offload import ResultStore
 
 
@@ -28,7 +28,7 @@ def storage():
     assert url.drivername == "oracle+oracledb"
     engine = create_engine(url, hide_parameters=True, pool_pre_ping=True)
     token = "lob_" + uuid4().hex[:12]
-    names = {"payload": token + "_p", "index": token + "_i", "versions": token + "_v"}
+    names = {"payload": token + "_p", "index": token + "_i", "versions": token + "_v", "legacy": token + "_old"}
     database = None
     preflight = False
     try:
@@ -56,7 +56,7 @@ def storage():
             if database is not None:
                 database.Session.remove()
             if preflight:
-                for name in (names["index"], names["payload"], names["versions"]):
+                for name in (names["index"], names["payload"], names["versions"], names["legacy"]):
                     try:
                         Table(name, MetaData()).drop(engine, checkfirst=True)
                     except Exception as error:
@@ -229,3 +229,105 @@ def test_failed_index_write_removes_the_new_large_payload(storage, monkeypatch):
         )
     with storage.engine.connect() as connection:
         assert connection.execute(select(func.count()).select_from(storage.backend.table)).scalar_one() == 0
+
+
+@pytest.mark.parametrize("user_id", ["alice", "bob", "s:", "u:alice", ""])
+def test_user_partitions_keep_all_filesystem_operations_isolated(storage, user_id):
+    backend = storage.backend
+    other = "control" if user_id != "control" else "other"
+    backend.write("unit", "report.txt", "private control", user_id=other)
+    meta = backend.write("unit", "report.txt", "café🙂" * 10000, user_id=user_id, expected_version=0)
+    assert meta.version == 1 and meta.user_id == (user_id or None)
+    with pytest.raises(VersionConflictError):
+        backend.write("unit", "report.txt", "duplicate", user_id=user_id, expected_version=0)
+    assert backend.read("unit", "report.txt", user_id=other) == "private control"
+    backend.write("unit", "report.txt", "", user_id=user_id, expected_version=1)
+    assert backend.read_with_meta("unit", "report.txt", user_id=user_id).content == ""
+    backend.append("unit", "report.txt", "owned marker", user_id=user_id)
+    assert backend.contains("unit", ["owned marker", "private control"], user_id=user_id) == {"owned marker"}
+    assert len(backend.search("unit", "owned", user_id=user_id)) == 1
+    assert backend.search("unit", "private control", user_id=user_id) == []
+    assert backend.usage("unit", user_id=user_id).file_count == 1
+    assert backend.list("unit", user_id=user_id)[0].user_id == (user_id or None)
+    assert set(backend.partitions("unit")) == ({user_id, other} - {""})
+    backend.move("unit", "report.txt", "moved.txt", user_id=user_id)
+    assert backend.read("unit", "report.txt", user_id=user_id) is None
+    assert backend.delete("unit", "moved.txt", user_id=user_id)
+    assert backend.read("unit", "report.txt", user_id=other) == "private control"
+
+
+@pytest.mark.asyncio
+async def test_native_async_filesystem_keeps_partitions_and_large_content(storage):
+    from agno.db.oracle.engine import create_async_oracle_engine
+
+    engine = create_async_oracle_engine(
+        storage.engine.url.set(drivername="oracle+oracledb_async"), hide_parameters=True
+    )
+    backend = AsyncDbFileSystem(SimpleNamespace(db_engine=engine), table_name=storage.names["payload"], db_schema=None)
+    try:
+        await backend.awrite("unit", "report.txt", "Bob", user_id="bob")
+        content = "café🙂" * 10000
+        first = await backend.awrite("unit", "report.txt", content, user_id="alice", expected_version=0)
+        assert first.version == 1 and first.user_id == "alice"
+        assert await backend.aread("unit", "report.txt", user_id="alice") == content
+        await backend.aappend("unit", "report.txt", "end", user_id="alice")
+        with pytest.raises(QuotaExceededError):
+            await backend.aappend("unit", "report.txt", "too much", user_id="alice", max_file_bytes=1)
+        assert await backend.aread("unit", "report.txt", user_id="alice") == content + "\nend\n"
+        await backend.amove("unit", "report.txt", "moved.txt", user_id="alice")
+        assert (await backend.aread_with_meta("unit", "moved.txt", user_id="alice")).metadata.user_id == "alice"
+        assert await backend.adelete("unit", "moved.txt", user_id="alice")
+        assert await backend.aread("unit", "report.txt", user_id="bob") == "Bob"
+        await backend.awrite("unit", "empty.txt", "")
+        assert (await backend.aread_with_meta("unit", "empty.txt")).content == ""
+    finally:
+        await engine.dispose()
+
+
+def test_explicit_legacy_upgrade_preserves_shared_files(storage):
+    legacy = Table(
+        storage.names["legacy"],
+        MetaData(),
+        *[
+            Column(column.name, column.type, nullable=column.nullable, primary_key=column.name in ("namespace", "path"))
+            for column in storage.backend.table.columns
+            if column.name != "user_id"
+        ],
+    )
+    legacy.create(storage.engine)
+    with storage.engine.begin() as connection:
+        connection.execute(
+            legacy.insert().values(
+                namespace="unit",
+                path="report.txt",
+                content="old",
+                size_bytes=3,
+                version=7,
+                created_at=123,
+                updated_at=124,
+            )
+        )
+    backend = DbFileSystem(db_engine=storage.engine, table_name=legacy.name, db_schema=None)
+    with pytest.raises(SchemaOutdatedError):
+        backend.read("unit", "report.txt")
+    assert backend.upgrade_schema() is True
+    assert backend.read("unit", "report.txt") == "old"
+    assert backend._stat("unit", "report.txt").version == 7
+    backend.write("unit", "report.txt", "Alice", user_id="alice")
+    assert backend.read("unit", "report.txt") == "old"
+    assert backend.read("unit", "report.txt", user_id="alice") == "Alice"
+    assert backend.upgrade_schema() is False
+
+
+def test_session_cleanup_preserves_named_partition_with_the_same_path(storage, monkeypatch):
+    ref = storage.store.offload(
+        session_id="S1", run_id="R1", tool_call_id="C1", tool_name="report", tool_args={}, output="x" * 68115
+    )
+    row = storage.store.get_row(ref.result_id)
+    storage.backend.write(row["namespace"], row["path"], "named control", user_id="bob")
+    monkeypatch.setattr(storage.database, "_default_payload_table", lambda: storage.names["payload"])
+    storage.database.tool_result_filesystems = []
+    storage.database._cascade_tool_results(["S1"])
+    assert storage.backend.read(row["namespace"], row["path"]) is None
+    assert storage.backend.read(row["namespace"], row["path"], user_id="bob") == "named control"
+    assert storage.store.get_row(ref.result_id) is None

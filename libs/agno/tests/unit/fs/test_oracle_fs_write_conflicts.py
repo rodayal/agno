@@ -26,6 +26,7 @@ def backend_case(monkeypatch):
         "unit_files",
         MetaData(),
         Column("namespace", String(255), primary_key=True),
+        Column("user_id", String(257), primary_key=True),
         Column("path", String(2000), primary_key=True),
         Column("content", Text),
         Column("size_bytes", BigInteger),
@@ -75,6 +76,7 @@ def test_success_reads_metadata_once_and_preserves_bound_values(backend_case, co
     assert "version=(unit_files.version +" in str(calls[0].args[0])
     assert calls[1].args[0].compile().params == {
         "namespace": "shared-work",
+        "user_id": "",
         "path": "report.txt",
         "content": content,
         "size_bytes": len(content.encode("utf-8")),
@@ -214,7 +216,7 @@ def test_public_oracle_write_delegates_inside_its_transaction(backend_case):
     assert case.backend.write("shared-work", "report.txt", "Draft B") is expected
     case.backend._ensure_table.assert_called_once()
     case.backend.db_engine.begin.assert_called_once()
-    case.backend._write_on.assert_called_once_with(case.connection, "shared-work", "report.txt", "Draft B")
+    case.backend._write_on.assert_called_once_with(case.connection, "shared-work", "report.txt", "Draft B", user_id="")
     case.connection.execute.assert_not_called()
 
 
@@ -259,3 +261,27 @@ def test_sqlite_caller_owned_transaction_is_unchanged(commit):
         assert backend.read("unit", "report.txt") == ("Draft B" if commit else None)
     finally:
         engine.dispose()
+
+
+@pytest.mark.parametrize("user_id", ["", "alice", "bob", "s:", "u:alice", "__agno_unowned__", "é🙂"])
+def test_oracle_partition_encoding_round_trips_without_reserved_usernames(user_id):
+    column_type = fs_module._OracleFileUserId()
+    dialect = oracle.dialect()
+    stored = column_type.process_bind_param(user_id, dialect)
+    assert stored
+    assert column_type.process_result_value(stored, dialect) == user_id
+    if user_id:
+        assert stored != column_type.process_bind_param("", dialect)
+
+
+@pytest.mark.parametrize("user_id", ["", "alice", "bob"])
+def test_write_and_metadata_read_are_scoped_to_the_user(backend_case, user_id):
+    case = backend_case
+    case.connection.execute.side_effect = [update_result(), object(), readback(1, "content")]
+    meta = case.backend._write_on(case.connection, "unit", "report.txt", "content", user_id=user_id)
+    assert meta.user_id == (user_id or None)
+    for call in case.connection.execute.call_args_list:
+        compiled = call.args[0].compile()
+        assert user_id in compiled.params.values()
+        assert "user_id" in str(compiled)
+    assert_no_transaction_management(case)
