@@ -36,6 +36,63 @@ from tests.integration.db.oracle import test_differential_oracle_postgres as dif
 
 # Migration dispatch
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    "latest_kind,incomplete_kind",
+    [
+        ("datetime", None),
+        (None, "datetime"),
+        ("datetime", "datetime"),
+        ("date", "datetime"),
+        ("datetime", "date"),
+        ("date", "date"),
+        ("future", None),
+        (None, None),
+    ],
+)
+async def test_metrics_resume_day_normalizes_oracle_date_values(asynchronous, latest_kind, incomplete_kind):
+    from sqlalchemy import Boolean, Date
+
+    today = datetime.now(timezone.utc).date()
+    latest_day = today + timedelta(days=5) if latest_kind == "future" else today - timedelta(days=3)
+    incomplete_day = today - timedelta(days=1)
+
+    def value(kind, day):
+        if kind is None:
+            return None
+        return day if kind == "date" else datetime.combine(day, datetime.min.time())
+
+    latest = value(latest_kind, latest_day)
+    incomplete = value(incomplete_kind, incomplete_day)
+    expected = incomplete_day if incomplete_kind else min(latest_day + timedelta(days=1), today)
+    if latest_kind is None and incomplete_kind is None:
+        expected = today - timedelta(days=7)
+    table = Table("metric_days", MetaData(), Column("date", Date), Column("completed", Boolean))
+    database = object.__new__(AsyncOracleDb if asynchronous else OracleDb)
+    session = MagicMock()
+    responses = [SimpleNamespace(scalar=lambda: latest), SimpleNamespace(scalar=lambda: incomplete)]
+    fallback = (
+        [{"created_at": int(datetime.combine(expected, datetime.min.time(), tzinfo=timezone.utc).timestamp())}],
+        1,
+    )
+    if asynchronous:
+        session.__aenter__.return_value = session
+        session.execute = AsyncMock(side_effect=responses)
+        database.async_session_factory = MagicMock(return_value=session)
+        database.get_sessions = AsyncMock(return_value=fallback)
+        actual = await database._get_metrics_calculation_starting_date(table)
+    else:
+        session.__enter__.return_value = session
+        session.execute.side_effect = responses
+        database.Session = MagicMock(return_value=session)
+        database.get_sessions = MagicMock(return_value=fallback)
+        actual = database._get_metrics_calculation_starting_date(table)
+    assert type(actual) is type(today)
+    assert actual == expected
+
+
 pytest.importorskip("sqlalchemy")
 
 

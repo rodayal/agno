@@ -1587,7 +1587,12 @@ class AsyncOracleDb(AsyncBaseDb):
             incomplete_result = await sess.execute(incomplete_stmt)
             earliest_incomplete = incomplete_result.scalar()
 
-            starting_date = metrics_starting_date_from_days(latest_completed, earliest_incomplete)
+            # Oracle DATE aggregates can arrive as datetime objects. The shared
+            # metrics rule operates on calendar dates, as PostgreSQL returns.
+            starting_date = metrics_starting_date_from_days(
+                latest_completed.date() if isinstance(latest_completed, datetime) else latest_completed,
+                earliest_incomplete.date() if isinstance(earliest_incomplete, datetime) else earliest_incomplete,
+            )
             if starting_date is not None:
                 return starting_date
 
