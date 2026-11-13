@@ -4,3 +4,11 @@ __pycache__/
 results/
 .env
 .env.*
+*.pem
+*.key
+*.p12
+*.pfx
+oci-iam.json
+model.json
+oracle-url
+openai-api-key

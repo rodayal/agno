@@ -31,11 +31,34 @@ def main():
             "inventory",
         ],
     )
+    parser.add_argument(
+        "--db-host",
+        action="append",
+        help="Approved Oracle host; repeat for an allowlist (init only)",
+    )
+    parser.add_argument(
+        "--db-user", default="DEMO_USER", help="Expected Oracle account (init only)"
+    )
+    parser.add_argument(
+        "--db-container", default="DEMO_PDB", help="Expected Oracle PDB (init only)"
+    )
+    parser.add_argument(
+        "--db-port", type=int, default=1521, help="Expected Oracle port (init only)"
+    )
     args = parser.parse_args()
     try:
         if args.command == "init":
             path = config.STATE_DIR / "deployment.json"
-            settings = Settings.load() if path.exists() else Settings.initialize()
+            settings = (
+                Settings.load()
+                if path.exists()
+                else Settings.initialize(
+                    expected_user=args.db_user,
+                    expected_container=args.db_container,
+                    expected_port=args.db_port,
+                    expected_hosts=tuple(args.db_host or ("localhost", "127.0.0.1")),
+                )
+            )
             print("Deployment prefix:", settings.prefix)
             print("Persistent deployment:", path)
             print("Existing Oracle/model credentials are not replaced.")
@@ -59,7 +82,7 @@ def main():
                     "OCI IAM settings already exist; review them privately."
                 )
             settings = OciIamSettings(
-                compartment_id=input("Genai_Shared compartment OCID: ").strip(),
+                compartment_id=input("Approved compartment OCID: ").strip(),
                 model_id=input("Model [openai.gpt-oss-20b]: ").strip()
                 or "openai.gpt-oss-20b",
                 profile_name=input("OCI profile [DEFAULT]: ").strip() or "DEFAULT",

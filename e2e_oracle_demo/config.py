@@ -51,28 +51,52 @@ def write_private(path: Path, value: str) -> None:
 class Settings:
     prefix: str
     port: int = 7777
-    expected_user: str = "AGNO_TEST_USER"
-    expected_container: str = "CDB1_PDB1"
-    expected_port: int = 1550
+    expected_user: str = "DEMO_USER"
+    expected_container: str = "DEMO_PDB"
+    expected_port: int = 1521
+    expected_hosts: tuple[str, ...] = ("localhost", "127.0.0.1")
 
     @classmethod
     def load(cls):
         try:
-            result = cls(**json.loads((STATE_DIR / "deployment.json").read_text()))
+            values = json.loads((STATE_DIR / "deployment.json").read_text())
+            if "expected_hosts" in values:
+                if not isinstance(values["expected_hosts"], list):
+                    raise TypeError("Invalid host allowlist")
+                values["expected_hosts"] = tuple(values["expected_hosts"])
+            result = cls(**values)
         except (OSError, ValueError, TypeError):
             raise ConfigurationError(
                 "Run python -m e2e_oracle_demo.cli init first."
             ) from None
+        return result.validate()
+
+    def validate(self):
         if (
-            not re.fullmatch(r"ae_[a-f0-9]{8}", result.prefix)
-            or not 1024 <= result.port <= 65535
+            not isinstance(self.prefix, str)
+            or not re.fullmatch(r"ae_[a-f0-9]{8}", self.prefix)
+            or type(self.port) is not int
+            or not 1024 <= self.port <= 65535
+            or type(self.expected_port) is not int
+            or not 1 <= self.expected_port <= 65535
+            or not isinstance(self.expected_user, str)
+            or not self.expected_user.strip()
+            or not isinstance(self.expected_container, str)
+            or not self.expected_container.strip()
+            or not isinstance(self.expected_hosts, tuple)
+            or not self.expected_hosts
+            or any(
+                not isinstance(host, str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.:-]*", host)
+                for host in self.expected_hosts
+            )
         ):
             raise ConfigurationError("Invalid demo deployment settings.")
-        return result
+        return self
 
     @classmethod
-    def initialize(cls):
-        result = cls(prefix="ae_" + uuid4().hex[:8])
+    def initialize(cls, **overrides):
+        result = cls(prefix="ae_" + uuid4().hex[:8], **overrides).validate()
         write_private(
             STATE_DIR / "deployment.json", json.dumps(asdict(result), indent=2)
         )
@@ -125,14 +149,7 @@ def validate_url(value: str, settings: Settings):
             and url.username.upper() == settings.expected_user.upper()
             and url.port == settings.expected_port
             and url.query.get("service_name")
-            and url.host
-            in {
-                "localhost",
-                "127.0.0.1",
-                "100.94.147.94",
-                "phoenix990761",
-                "phoenix990761.dev3sub4phx.databasede3phx.oraclevcn.com",
-            }
+            and url.host in settings.expected_hosts
         )
     except Exception:
         valid = False

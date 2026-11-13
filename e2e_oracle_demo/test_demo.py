@@ -72,13 +72,7 @@ def test_configured_provider_failure_does_not_switch_to_static(
     assert models.STATIC_REQUEST.get() is None
 
 
-APPROVED_HOSTS = (
-    "localhost",
-    "127.0.0.1",
-    "100.94.147.94",
-    "phoenix990761",
-    "phoenix990761.dev3sub4phx.databasede3phx.oraclevcn.com",
-)
+APPROVED_HOSTS = ("localhost", "127.0.0.1")
 
 
 @pytest.fixture(autouse=True)
@@ -126,11 +120,11 @@ def ready_provider():
 def oracle_url(**overrides):
     fields = {
         "drivername": "oracle+oracledb",
-        "username": "AGNO_TEST_USER",
+        "username": "DEMO_USER",
         "password": "offline-password-never-sent",
         "host": "localhost",
-        "port": 1550,
-        "query": {"service_name": "CDB1_PDB1"},
+        "port": 1521,
+        "query": {"service_name": "DEMO_PDB"},
     }
     fields.update(overrides)
     return URL.create(**fields).render_as_string(hide_password=False)
@@ -188,10 +182,10 @@ def test_settings_initialize_persists_and_loads_private_deployment():
     path = config.STATE_DIR / "deployment.json"
     assert re.fullmatch(r"ae_[a-f0-9]{8}", initialized.prefix)
     assert initialized.port == 7777
-    assert initialized.expected_user == "AGNO_TEST_USER"
-    assert initialized.expected_container == "CDB1_PDB1"
-    assert initialized.expected_port == 1550
-    assert json.loads(path.read_text()) == asdict(initialized)
+    assert initialized.expected_user == "DEMO_USER"
+    assert initialized.expected_container == "DEMO_PDB"
+    assert initialized.expected_port == 1521
+    assert json.loads(path.read_text()) == json.loads(json.dumps(asdict(initialized)))
     assert config.Settings.load() == initialized
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
@@ -207,6 +201,71 @@ def test_settings_initialize_and_private_write_refuse_overwrite():
         config.write_private(path, "replacement")
     assert path.read_bytes() == before
     assert config.Settings.load() == original
+
+
+def test_private_host_allowlist_roundtrip_and_exact_matching():
+    settings = config.Settings.initialize(
+        expected_hosts=("db.example.invalid",),
+        expected_user="PRIVATE_DEMO_USER",
+        expected_container="PRIVATE_DEMO_PDB",
+        expected_port=1523,
+    )
+    restored = config.Settings.load()
+    assert restored == settings
+    assert restored.expected_hosts == ("db.example.invalid",)
+    approved = oracle_url(
+        host="db.example.invalid",
+        username="private_demo_user",
+        port=1523,
+        query={"service_name": "PRIVATE_DEMO_PDB"},
+    )
+    assert config.validate_url(approved, restored).host == "db.example.invalid"
+    for host in ("localhost", "db.example.invalid.evil.invalid", "other.invalid"):
+        with pytest.raises(config.ConfigurationError):
+            config.validate_url(
+                oracle_url(host=host, username="private_demo_user", port=1523),
+                restored,
+            )
+
+
+@pytest.mark.parametrize(
+    "hosts", [[], "db.example.invalid", ["*"], [""], [1], ["db.example.invalid/path"]]
+)
+def test_private_host_allowlist_rejects_invalid_settings(hosts):
+    config.STATE_DIR.mkdir()
+    (config.STATE_DIR / "deployment.json").write_text(
+        json.dumps({"prefix": "ae_deadbeef", "expected_hosts": hosts})
+    )
+    with pytest.raises(config.ConfigurationError):
+        config.Settings.load()
+
+
+def test_cli_init_saves_explicit_private_database_target(monkeypatch):
+    from e2e_oracle_demo import cli
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "demo",
+            "init",
+            "--db-host",
+            "db.example.invalid",
+            "--db-host",
+            "backup.example.invalid",
+            "--db-user",
+            "CUSTOM_USER",
+            "--db-container",
+            "CUSTOM_PDB",
+            "--db-port",
+            "1523",
+        ],
+    )
+    cli.main()
+    settings = config.Settings.load()
+    assert settings.expected_hosts == ("db.example.invalid", "backup.example.invalid")
+    assert settings.expected_user == "CUSTOM_USER"
+    assert settings.expected_container == "CUSTOM_PDB"
+    assert settings.expected_port == 1523
 
 
 def test_settings_load_rejects_missing_corrupt_and_invalid_deployments():
@@ -343,7 +402,7 @@ def test_validate_url_accepts_all_approved_hosts_and_case_insensitive_account():
     settings = config.Settings(prefix="ae_deadbeef")
     for host in APPROVED_HOSTS:
         parsed = config.validate_url(
-            oracle_url(host=host, username="agno_test_user"), settings
+            oracle_url(host=host, username="demo_user"), settings
         )
         assert parsed.drivername == "oracle+oracledb"
         assert parsed.host == host
@@ -369,8 +428,8 @@ def test_validate_url_rejects_every_incomplete_or_unapproved_component():
             {"host": "unapproved.invalid"},
             {"host": "localhost.evil.invalid"},
             {"port": None},
-            {"port": 1521},
-            {"port": 1551},
+            {"port": 1520},
+            {"port": 1522},
             {"query": {}},
             {"query": {"service_name": ""}},
         )
@@ -388,9 +447,9 @@ def test_validate_url_rejects_every_incomplete_or_unapproved_component():
             assert value not in str(error.value)
     # The approval guard uses the supplied deployment's account and port.
     custom = config.Settings(
-        prefix="ae_deadbeef", expected_user="CUSTOM_USER", expected_port=1552
+        prefix="ae_deadbeef", expected_user="CUSTOM_USER", expected_port=1523
     )
-    config.validate_url(oracle_url(username="custom_user", port=1552), custom)
+    config.validate_url(oracle_url(username="custom_user", port=1523), custom)
     with pytest.raises(config.ConfigurationError):
         config.validate_url(oracle_url(), custom)
 

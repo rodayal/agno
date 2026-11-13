@@ -55,8 +55,14 @@ def scope(user="alice"):
 def test_oracle_identity_and_clear_model_status(client):
     result = client.get("/api/status").json()
     assert result["database"]["connected"]
-    assert result["database"]["identity"]["user"] == "AGNO_TEST_USER"
-    assert result["database"]["identity"]["container"] == "CDB1_PDB1"
+    assert (
+        result["database"]["identity"]["user"]
+        == client.app.state.runtime.settings.expected_user
+    )
+    assert (
+        result["database"]["identity"]["container"]
+        == client.app.state.runtime.settings.expected_container
+    )
     assert result["capabilities"]["paid_requests_automatic"] is False
 
 
